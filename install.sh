@@ -3,22 +3,41 @@
 # Installs Neural HUD for Claude Code: copies the scripts to ~/.claude/neural-hud
 # and adds the hooks to ~/.claude/settings.json (a backup is written first).
 #
-#   ./install.sh [--monitor NAME] [--shortcut '<Super><Alt>n']
+#   ./install.sh [--monitor NAME] [--theme NAME] [--context SIZE] [--shortcut '<Super><Alt>n']
 #
 #   --monitor   xrandr output (HDMI-1) or EDID text (a brand name) of the screen to use.
 #               Default: the smallest non-primary monitor.
+#   --theme     colour theme: cyan (default), amber, phosphor, red or violet.
+#   --context   context window the gauge measures against, e.g. 200k or 1m.
+#               Default: 200k, switching to 1m once a session goes past 200k.
 #   --shortcut  GNOME only: bind a key combination that closes the HUD.
 set -euo pipefail
 
 MONITOR=""
+THEME=""
+CONTEXT=""
 SHORTCUT=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --monitor) MONITOR="$2"; shift 2 ;;
+    --theme) THEME="$2"; shift 2 ;;
+    --context) CONTEXT="$2"; shift 2 ;;
     --shortcut) SHORTCUT="$2"; shift 2 ;;
     *) echo "unknown option: $1" >&2; exit 1 ;;
   esac
 done
+
+case "${THEME,,}" in
+  ""|cyan|amber|phosphor|red|violet) ;;
+  *) echo "unknown theme: $THEME (cyan, amber, phosphor, red, violet)" >&2; exit 1 ;;
+esac
+if [[ -n "$CONTEXT" ]]; then
+  CONTEXT=$(python3 -c "
+import re, sys
+m = re.fullmatch(r'(\d+(?:\.\d+)?)([km]?)', sys.argv[1].strip().lower())
+print(int(float(m[1]) * {'': 1, 'k': 1e3, 'm': 1e6}[m[2]]) if m else '')" "$CONTEXT")
+  [[ -n "$CONTEXT" ]] || { echo "--context takes a size such as 200k or 1m" >&2; exit 1; }
+fi
 
 python3 -c "import PyQt6.QtOpenGLWidgets" 2>/dev/null || {
   echo "PyQt6 is missing: install it with your package manager (e.g. python3-pyqt6) or pip." >&2; exit 1; }
@@ -34,13 +53,14 @@ SETTINGS="$HOME/.claude/settings.json"
 [[ -f "$SETTINGS" ]] || echo '{}' > "$SETTINGS"
 cp "$SETTINGS" "$SETTINGS.bak-neural-hud"
 
-MONITOR="$MONITOR" SETTINGS="$SETTINGS" python3 - <<'EOF'
+MONITOR="$MONITOR" THEME="${THEME,,}" CONTEXT="$CONTEXT" SETTINGS="$SETTINGS" python3 - <<'EOF'
 import json, os, shlex
 path = os.environ["SETTINGS"]
 s = json.load(open(path))
 cmd = "python3 ~/.claude/neural-hud/hook.py"
-if os.environ["MONITOR"]:
-    cmd = f"NEURAL_HUD_MONITOR={shlex.quote(os.environ['MONITOR'])} {cmd}"
+for var, key in (("CONTEXT", "NEURAL_HUD_CONTEXT_WINDOW"), ("THEME", "NEURAL_HUD_THEME"), ("MONITOR", "NEURAL_HUD_MONITOR")):
+    if os.environ[var]:
+        cmd = f"{key}={shlex.quote(os.environ[var])} {cmd}"
 hooks = s.setdefault("hooks", {})
 for ev in list(hooks):  # drop a previous install, keep everything else
     hooks[ev] = [e for e in hooks[ev]

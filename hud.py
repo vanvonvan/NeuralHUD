@@ -13,7 +13,12 @@ Fed by hook.py through files in $XDG_RUNTIME_DIR/claude-neural/:
   plan-<session>.json  the session's plan: {"ts", "items": [{"id", "text", "active", "status"}]}
   events.jsonl         one line per tool call: {"ts", "kind", "detail", "id", "tool"},
                        and an "END" line with the same id when the call finishes
-  turn_start           timestamp of the last prompt
+  turn_start           timestamp of the last prompt (any session)
+  turn-<session>       timestamp of that session's last prompt
+  m-<session>.json     {"cwd", "transcript"}: project dir (header) and transcript (context gauge)
+
+NEURAL_HUD_THEME picks the palette (cyan, amber, phosphor, red, violet), and
+NEURAL_HUD_CONTEXT_WINDOW the context size the gauge measures against.
 """
 import fcntl
 import json
@@ -41,6 +46,22 @@ TURN = os.path.join(STATE_DIR, "turn_start")
 STALE_AFTER = 20 * 60
 FPS = 24
 
+# Themes re-hue the HUD's own chrome and keep the brightness of every shade. The action
+# colours (READ cyan, WRITE magenta, ...) carry meaning and stay as they are.
+THEMES = {"cyan": None, "amber": 34, "phosphor": 135, "red": 354, "violet": 266}
+THEME = os.environ.get("NEURAL_HUD_THEME", "").strip().lower() or "cyan"
+HUE = THEMES.get(THEME)
+
+
+def T(*args):
+    """A chrome colour in the current theme."""
+    c = QColor(*args)
+    if HUE is not None:
+        h, s, v, a = c.getHsv()
+        c.setHsv(HUE, s, v, a)
+    return c
+
+
 KIND_COLORS = {
     "READ": "#4fd8ff", "WRITE": "#ff5fd8", "EXEC": "#ffb347", "SEARCH": "#6dff9e",
     "AGENT": "#b18cff", "NET": "#e8f4ff", "MCP": "#ffe66d", "SKILL": "#ff8f6d",
@@ -49,7 +70,13 @@ KIND_COLORS = {
 }
 SPINNER = "◐◓◑◒"
 BAR_KINDS = ["READ", "WRITE", "EXEC", "SEARCH", "AGENT", "MCP", "NET", "SKILL"]
-CYAN = QColor("#4fd8ff")
+CYAN = T("#4fd8ff")  # the theme's primary colour
+RED = QColor("#ff4f5e")
+SESSION_COLORS = ["#4fd8ff", "#ff5fd8", "#ffe66d", "#6dff9e", "#b18cff"]
+KIND_COLORS["LINK"] = CYAN.name()
+CONTEXT_WINDOW = int(os.environ.get("NEURAL_HUD_CONTEXT_WINDOW", "0") or 0)
+SUMMARY_FOR = 4.2   # seconds the end-of-task summary shows before the CRT power-off
+CRT_FOR = 0.85
 GREEN = QColor("#7dffb0")
 AMBER = QColor("#ffb347")
 
@@ -170,7 +197,8 @@ def read_states():
         p, sid = os.path.join(STATE_DIR, f), f[2:]
         try:
             if now - os.path.getmtime(p) > STALE_AFTER:
-                for leftover in (p, os.path.join(STATE_DIR, "w-" + sid), os.path.join(STATE_DIR, f"plan-{sid}.json")):
+                for leftover in (p, os.path.join(STATE_DIR, "w-" + sid), os.path.join(STATE_DIR, f"plan-{sid}.json"),
+                                 os.path.join(STATE_DIR, f"m-{sid}.json"), os.path.join(STATE_DIR, f"turn-{sid}")):
                     try:
                         os.remove(leftover)
                     except OSError:
@@ -191,6 +219,65 @@ def read_json(path):
             return json.load(f)
     except (OSError, ValueError):
         return None
+
+
+def read_float(path):
+    try:
+        with open(path) as f:
+            return float(f.read().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def git_branch(cwd):
+    """The branch checked out in cwd (or a short commit when detached), else ""."""
+    d = cwd
+    while d and d != os.path.dirname(d):
+        g = os.path.join(d, ".git")
+        try:
+            if os.path.isfile(g):  # a worktree or submodule: "gitdir: <path>"
+                with open(g) as f:
+                    g = os.path.join(d, f.read().split(":", 1)[1].strip())
+            if os.path.isdir(g):
+                with open(os.path.join(g, "HEAD")) as f:
+                    head = f.read().strip()
+                return head.rsplit("/", 1)[-1] if head.startswith("ref:") else head[:7]
+        except (OSError, IndexError):
+            return ""
+        d = os.path.dirname(d)
+    return ""
+
+
+def read_context(path):
+    """Tokens in the session's context: the newest main-thread usage in its transcript."""
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, 2)
+            f.seek(max(0, f.tell() - 512 * 1024))
+            tail = f.read().decode("utf-8", "replace").splitlines()
+    except OSError:
+        return None
+    for line in reversed(tail):
+        if '"usage"' not in line:
+            continue
+        try:
+            d = json.loads(line)
+        except ValueError:
+            continue
+        msg = d.get("message") if isinstance(d, dict) else None
+        if d.get("isSidechain") or not isinstance(msg, dict) or not isinstance(msg.get("usage"), dict):
+            continue
+        us = msg["usage"]
+        tokens = sum(int(us.get(k) or 0) for k in ("input_tokens", "cache_creation_input_tokens",
+                                                     "cache_read_input_tokens", "output_tokens"))
+        return tokens, str(msg.get("model") or "")
+    return None
+
+
+def context_window(tokens, model):
+    if CONTEXT_WINDOW:
+        return CONTEXT_WINDOW
+    return 1_000_000 if tokens > 200_000 or "[1m]" in model.lower() else 200_000
 
 
 def read_reason(states):
@@ -289,9 +376,19 @@ class HUD(QOpenGLWidget):
         self.reason = None     # (kind, detail) shown on the standby screen
         self.plan = None       # [{"text", "active", "status"}] or None
         self.last_beat = 0.0
+        self.sessions = {}     # sid -> {"state", "cwd", "transcript"}
+        self.turns = {}        # sid -> that session's turn start
+        self.sid_colors = {}
+        self.branches = {}     # cwd -> (checked at, branch)
+        self.ctx = None        # (tokens, window) of the session in focus
+        self.last_ctx = 0.0
+        self.fault_at = 0.0
+        self.summary = None
+        self.crt_at = 1.15     # seconds into the outro when the CRT power-off starts
 
         self.build_net()
         self.build_bg()
+        self.poll_sessions(read_states())
         self.read_new_events(initial=True)
 
         self.timer = QTimer(self)
@@ -330,19 +427,19 @@ class HUD(QOpenGLWidget):
     def build_bg(self):
         W, H, u = self.W, self.H, self.u
         pm = QPixmap(W, H)
-        pm.fill(QColor("#02040a"))
+        pm.fill(T("#02040a"))
         p = QPainter(pm)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         g = QRadialGradient(self.cx, self.cy, H * 0.75)
-        g.setColorAt(0, QColor(12, 34, 72, 150))
+        g.setColorAt(0, T(12, 34, 72, 150))
         g.setColorAt(1, QColor(0, 0, 0, 0))
         p.fillRect(0, 0, W, H, QBrush(g))
         # dot grid
-        p.setPen(QPen(QColor(30, 60, 110, 70), max(1, 2 * u)))
+        p.setPen(QPen(T(30, 60, 110, 70), max(1, 2 * u)))
         step = int(44 * u)
         p.drawPoints(QPolygonF([QPointF(i, j) for i in range(step, W, step) for j in range(step, H, step)]))
         # top rule with ticks
-        p.setPen(QPen(QColor(79, 216, 255, 60), max(1, u)))
+        p.setPen(QPen(T(79, 216, 255, 60), max(1, u)))
         top = 118 * u
         p.drawLine(QLineF(60 * u, top, W - 60 * u, top))
         p.drawLines([QLineF(i, top, i, top + (14 if k % 10 == 0 else 6) * u)
@@ -368,7 +465,7 @@ class HUD(QOpenGLWidget):
     def brackets(self, p, x0, y0, x1, y1):
         u = self.u
         L = 40 * u
-        p.setPen(QPen(QColor(79, 216, 255, 120), max(1, 2.5 * u)))
+        p.setPen(QPen(T(79, 216, 255, 120), max(1, 2.5 * u)))
         for (x, y, dx, dy) in ((x0, y0, 1, 1), (x1, y0, -1, 1), (x0, y1, 1, -1), (x1, y1, -1, -1)):
             p.drawLine(QLineF(x, y, x + dx * L, y))
             p.drawLine(QLineF(x, y, x, y + dy * L))
@@ -412,7 +509,7 @@ class HUD(QOpenGLWidget):
                 ev = json.loads(line)
             except ValueError:
                 continue
-            if ev.get("ts", 0) < self.turn_start - 1:
+            if ev.get("ts", 0) < self.turn_of(ev) - 1:
                 continue
             if ev.get("kind") == "END":
                 self.finish(ev)
@@ -420,7 +517,7 @@ class HUD(QOpenGLWidget):
             ev["born"] = 0 if initial else now
             if ev.get("tool"):
                 if ev.get("id") in self.ended:
-                    ev["dur"] = max(0.0, self.ended.pop(ev["id"]) - ev["ts"])
+                    self.close_step(ev, self.ended.pop(ev["id"]))
                 else:
                     self.running.append(ev)
             self.events.append(ev)
@@ -438,10 +535,62 @@ class HUD(QOpenGLWidget):
             match = next((e for e in self.running if e.get("tool") == end.get("tool")), None)
         if match is None:
             if key:
-                self.ended[key] = end.get("ts", 0)
+                self.ended[key] = end
             return
         self.running.remove(match)
-        match["dur"] = max(0.0, end.get("ts", 0) - match.get("ts", 0) - match.get("held", 0))
+        self.close_step(match, end)
+
+    def close_step(self, ev, end):
+        ev["dur"] = max(0.0, end.get("ts", 0) - ev.get("ts", 0) - ev.get("held", 0))
+        ev["end_at"] = time.time()
+        for k in ("add", "rm", "file"):
+            if end.get(k):
+                ev[k] = end[k]
+
+    def turn_of(self, ev):
+        return self.turns.get(ev.get("sid"), self.turn_start)
+
+    def poll_sessions(self, states):
+        """Refresh each session's state, project and turn. When one session starts a new turn,
+        only its own old steps leave the view: the other sessions keep their tracks."""
+        for sid, st in states.items():
+            meta = read_json(os.path.join(STATE_DIR, f"m-{sid}.json")) or {}
+            self.sessions[sid] = {"state": st, "cwd": meta.get("cwd", ""), "transcript": meta.get("transcript", "")}
+            turn = read_float(os.path.join(STATE_DIR, f"turn-{sid}"))
+            if turn and turn != self.turns.get(sid):
+                if sid in self.turns:
+                    old = lambda e: e.get("sid") == sid and e.get("ts", 0) < turn - 1  # noqa: E731
+                    self.events = [e for e in self.events if not old(e)]
+                    self.running = [e for e in self.running if not old(e)]
+                self.turns[sid] = turn
+            if sid not in self.sid_colors:
+                self.sid_colors[sid] = QColor(SESSION_COLORS[len(self.sid_colors) % len(SESSION_COLORS)])
+        for sid in list(self.sessions):
+            if sid not in states:
+                del self.sessions[sid]
+
+    def branch(self, cwd):
+        now = time.time()
+        hit = self.branches.get(cwd)
+        if not hit or now - hit[0] > 2:
+            hit = self.branches[cwd] = (now, git_branch(cwd))
+        return hit[1]
+
+    def focus_sid(self):
+        """The session the context gauge follows: the one that acted last."""
+        for e in reversed(self.events):
+            if e.get("sid") in self.sessions:
+                return e["sid"]
+        return next(iter(self.sessions), None)
+
+    def poll_context(self, now):
+        if now - self.last_ctx < 3:
+            return
+        self.last_ctx = now
+        sess = self.sessions.get(self.focus_sid()) or {}
+        got = read_context(sess.get("transcript", "")) if sess.get("transcript") else None
+        if got:
+            self.ctx = (got[0], context_window(*got))
 
     def elapsed(self, ev, now):
         """How long a step has run so far (or took), minus any time held on a prompt."""
@@ -451,6 +600,11 @@ class HUD(QOpenGLWidget):
         return max(0.0, now - ev.get("ts", now) - held)
 
     def on_event(self, ev):
+        if ev.get("kind") == "FAULT":  # a failed step: red glitch, shake and shock
+            self.fault_at = time.time()
+            self.shocks.append((self.fault_at, RED))
+            for i in random.sample(range(len(self.pts)), 14):
+                self.fire(i, RED, fanout=2)
         if self.waiting_since is not None:
             return  # keep the standby palette until work resumes
         c = QColor(KIND_COLORS.get(ev.get("kind"), "#9fb4d8"))
@@ -476,9 +630,8 @@ class HUD(QOpenGLWidget):
         if now - self.last_poll > 0.2:
             self.last_poll = now
             states = read_states()
-            turn = read_turn_start()
-            if turn != self.turn_start:  # a new prompt: steps left running were interrupted
-                self.turn_start, self.running, self.ended = turn, [], {}
+            self.turn_start = read_turn_start()
+            self.poll_sessions(states)  # a new prompt drops that session's old (and interrupted) steps
             if dismissed_since(self.turn_start):
                 QApplication.quit()
                 return
@@ -491,15 +644,15 @@ class HUD(QOpenGLWidget):
                     self.started = now
                     self.show()
                     self.raise_()
-                if self.closing and now - self.closing < 1.0:
-                    self.closing = None
+                if self.closing and now - self.closing < self.crt_at:
+                    self.closing, self.summary = None, None
             elif self.started is None:
                 if now - self.t0 > 1.5:
                     QApplication.quit()
                     return
             elif "waiting" in vals:
-                if self.closing and now - self.closing < 1.0:
-                    self.closing = None
+                if self.closing and now - self.closing < self.crt_at:
+                    self.closing, self.summary = None, None
                 if not self.closing and now - self.last_working > 0.6:
                     self.reason = read_reason(states) or self.reason or ("PERMISSION", "Claude needs your input")
                     if self.waiting_since is None:
@@ -508,13 +661,16 @@ class HUD(QOpenGLWidget):
                 self.end_wait(now)
                 self.closing = now
                 self.close_msg, self.close_color = "TASK COMPLETE", GREEN
+                self.summary = self.make_summary(now)
+                self.crt_at = SUMMARY_FOR if self.summary else 1.15
                 for i in range(0, len(self.pts), 3):
                     self.fire(i, self.close_color, fanout=1)
                 self.shocks.append((now, self.close_color))
 
         self.read_new_events()
+        self.poll_context(now)
         self.simulate(now, dt)
-        if self.closing and now - self.closing > 2.0:
+        if self.closing and now - self.closing > self.crt_at + CRT_FOR + 0.05:
             QApplication.quit()
             return
         if self.started:
@@ -579,15 +735,20 @@ class HUD(QOpenGLWidget):
         now = time.time()
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        if self.closing and now - self.closing > 1.15:
-            self.draw_crt_off(p, (now - self.closing - 1.15) / 0.85)
+        if self.closing and now - self.closing > self.crt_at:
+            self.draw_crt_off(p, (now - self.closing - self.crt_at) / CRT_FOR)
             p.end()
             return
         boot = ease((now - self.started) / 1.1) if self.started else 0
+        glitch = max(0.0, 1 - (now - self.fault_at) / 0.7)
+        if glitch:  # a failed step shakes the whole display
+            p.translate(random.uniform(-1, 1) * 12 * self.u * glitch, random.uniform(-1, 1) * 7 * self.u * glitch)
         p.drawPixmap(0, 0, self.bg)
         p.setOpacity(boot)
         self.draw_core(p, now, boot)
         self.draw_net(p, boot)
+        self.draw_satellites(p, now)
+        self.draw_context(p)
         p.setOpacity(ease((now - self.started - 0.3) / 0.8) if self.started else 0)
         self.draw_header(p, now)
         self.draw_stream(p, now)
@@ -596,6 +757,8 @@ class HUD(QOpenGLWidget):
         p.setOpacity(1)
         if self.started and now - self.started < 1.6:
             self.draw_boot_text(p, now - self.started)
+        if glitch:
+            self.draw_glitch(p, glitch)
         if self.waiting_since is not None and not self.closing:
             self.draw_standby(p, now)
         if self.closing:
@@ -658,7 +821,7 @@ class HUD(QOpenGLWidget):
             d = (pr[a][2] + pr[b][2]) / 2
             buckets[0 if d < 0.45 else 1 if d < 0.7 else 2].append(QLineF(pr[a][0], pr[a][1], pr[b][0], pr[b][1]))
         for i, lines in enumerate(buckets):
-            p.setPen(QPen(QColor(60, 140, 230, (35, 70, 120)[i]), max(1, (1, 1.4, 1.8)[i] * u)))
+            p.setPen(QPen(T(60, 140, 230, (35, 70, 120)[i]), max(1, (1, 1.4, 1.8)[i] * u)))
             p.drawLines(lines)
         p.setCompositionMode(QPainter.CompositionMode.CompositionMode_Plus)
         for a, b, t, _, c in self.signals:
@@ -677,9 +840,112 @@ class HUD(QOpenGLWidget):
         p.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
         p.setPen(Qt.PenStyle.NoPen)
         for (x, y, d) in pr:
-            p.setBrush(QColor(140, 200, 255, int(70 + 180 * d)))
+            p.setBrush(T(140, 200, 255, int(70 + 180 * d)))
             r = (2 + 3 * d) * u
             p.drawEllipse(QPointF(x, y), r, r)
+
+    def draw_satellites(self, p, now):
+        """Each running subagent orbits the core as its own small cluster, and fades out
+        for a second once it reports back."""
+        u, R = self.u, self.R
+        agents = [e for e in self.events[-200:] if e.get("tool") in ("Agent", "Task")
+                  and ("dur" not in e or now - e.get("end_at", 0) < 1.0)][-5:]
+        col = QColor(KIND_COLORS["AGENT"])
+        base = p.opacity()
+        for e in agents:
+            k = 1.0 if "dur" not in e else max(0.0, 1 - (now - e["end_at"]) / 1.0)
+            k *= min(1.0, (now - (e.get("born") or now - 1)) / 0.6) if e.get("born") else 1.0
+            seed = sum(map(ord, str(e.get("id") or e.get("ts"))))
+            ang = math.radians(seed % 360 + (now - e.get("ts", now)) * 7)
+            r = R * 1.30
+            x, y = self.cx + math.cos(ang) * r, self.cy + math.sin(ang) * r
+            p.setOpacity(base * k)
+            pen = QPen(with_alpha(col, 110), max(1, 1.5 * u))
+            pen.setDashPattern([3, 4])
+            p.setPen(pen)
+            p.drawLine(QLineF(self.cx + math.cos(ang) * R * 0.92, self.cy + math.sin(ang) * R * 0.92, x, y))
+            p.setPen(QPen(with_alpha(col, 200), 2 * u))
+            p.setBrush(QColor(8, 6, 20, 220))
+            p.drawEllipse(QPointF(x, y), 30 * u, 30 * u)
+            spin = now * 2.4 + seed
+            pts = [QPointF(x + math.cos(spin + j * 1.047) * 19 * u, y + math.sin(spin + j * 1.047) * 19 * u) for j in range(6)]
+            p.setPen(QPen(with_alpha(col, 120), max(1, u)))
+            for j, q in enumerate(pts):
+                p.drawLine(QLineF(q, pts[(j + 2) % 6]))
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(with_alpha(col, 230))
+            for q in pts:
+                p.drawEllipse(q, 3 * u, 3 * u)
+            p.setCompositionMode(QPainter.CompositionMode.CompositionMode_Plus)
+            s = 26 * u * (1 + 0.15 * math.sin(now * 6 + seed))
+            p.drawPixmap(QRectF(x - s, y - s, 2 * s, 2 * s), self.sprite(col), QRectF(0, 0, 64, 64))
+            p.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
+            f = self.font(17)
+            fm = QFontMetrics(f)
+            t = "✓ " + fmt_dur(e["dur"]) if "dur" in e else f"{SPINNER[int(now * 6) % 4]} {fmt_dur(self.elapsed(e, now), True)}"
+            label = fm.elidedText(e.get("detail", ""), Qt.TextElideMode.ElideRight, int(260 * u)) + "  " + t
+            lw = fm.horizontalAdvance(label)
+            left, right = self.panel_rects()[0][2] + 16 * u, self.panel_rects()[1][0] - 16 * u
+            lx = min(max(x - lw / 2, left), right - lw)
+            ly = y + 58 * u if y >= self.cy - R * 0.2 else y - 42 * u  # away from the context gauge
+            p.setFont(f)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QColor(4, 6, 14, 190))
+            p.drawRect(QRectF(lx - 8 * u, ly - fm.ascent() - 4 * u, lw + 16 * u, fm.height() + 6 * u))
+            p.setPen(with_alpha(col, 235))
+            p.drawText(QPointF(lx, ly), label)
+        p.setOpacity(base)
+        p.setBrush(Qt.BrushStyle.NoBrush)
+
+    def draw_context(self, p):
+        """How full the focused session's context window is: an arc over the core."""
+        if not self.ctx:
+            return
+        u, R = self.u, self.R
+        tokens, window = self.ctx
+        frac = min(1.0, tokens / window)
+        r = R * 1.47
+        rect = QRectF(self.cx - r, self.cy - r, 2 * r, 2 * r)
+        col = RED if frac > 0.85 else AMBER if frac > 0.6 else CYAN
+        n = 50
+        lit = round(frac * n)
+        for i in range(n):  # one radial tick per 2%, lit up to the fill level
+            a = math.radians(140 - 100 * (i + 0.5) / n)
+            long_ = i % 5 == 4
+            p.setPen(QPen(with_alpha(col, 235) if i < lit else T(40, 80, 140, 150), (3.2 if i < lit else 2.2) * u))
+            r0, r1 = r - 8 * u, r + (14 if long_ else 8) * u
+            p.drawLine(QLineF(self.cx + math.cos(a) * r0, self.cy - math.sin(a) * r0,
+                              self.cx + math.cos(a) * r1, self.cy - math.sin(a) * r1))
+        kt = f"{tokens / 1000:.0f}k" if tokens < 1_000_000 else f"{tokens / 1e6:.2f}M"
+        kw = f"{window // 1000}k" if window < 1_000_000 else f"{window // 1_000_000}M"
+        label = f"CONTEXT  {kt} / {kw}  ·  {frac * 100:.0f}%"
+        f = self.font(17)
+        p.setFont(f)
+        p.setPen(with_alpha(col, 220))
+        p.drawText(QPointF(self.cx - QFontMetrics(f).horizontalAdvance(label) / 2, self.cy - r - 26 * u), label)
+
+    def draw_glitch(self, p, g):
+        """Red interference over the display for a moment after a step fails."""
+        u = self.u
+        p.fillRect(QRectF(-40 * u, -40 * u, self.W + 80 * u, self.H + 80 * u), with_alpha(RED, 45 * g))
+        for _ in range(9):
+            y = random.uniform(0, self.H)
+            h = random.uniform(3, 28) * u
+            dx = random.uniform(-60, 60) * u * g
+            p.fillRect(QRectF(dx, y, self.W, h), with_alpha(RED, 90 * g))
+            p.fillRect(QRectF(-dx, y + h, self.W, max(1, 2 * u)), with_alpha(CYAN, 120 * g))
+        f = self.font(44, True)
+        f.setLetterSpacing(QFont.SpacingType.PercentageSpacing, 125)
+        fm = QFontMetrics(f)
+        txt = "SIGNAL FAULT"
+        box = QRectF(self.cx - fm.horizontalAdvance(txt) / 2 - 30 * u, self.cy - fm.ascent() / 2 - 22 * u,
+                     fm.horizontalAdvance(txt) + 60 * u, fm.ascent() + 44 * u)
+        p.fillRect(box, QColor(20, 0, 4, int(220 * g)))
+        p.setPen(QPen(with_alpha(RED, 255 * g), 2 * u))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawRect(box)
+        p.setFont(f)
+        p.drawText(QPointF(box.left() + 30 * u, self.cy + fm.ascent() / 2 - 6 * u), txt)
 
     def draw_header(self, p, now):
         u = self.u
@@ -701,7 +967,44 @@ class HUD(QOpenGLWidget):
         p.setFont(self.font(30, True))
         p.setPen(CYAN)
         clock = time.strftime("%H:%M:%S")
-        p.drawText(QPointF(self.W - 64 * u - QFontMetrics(self.font(30, True)).horizontalAdvance(clock), 92 * u), clock)
+        cw = QFontMetrics(self.font(30, True)).horizontalAdvance(clock)
+        p.drawText(QPointF(self.W - 64 * u - cw, 92 * u), clock)
+
+        # the project and branch each live session is working in
+        live = [(sid, s) for sid, s in self.sessions.items() if s["state"] in ("working", "waiting") and s["cwd"]]
+        if not live:
+            return
+        f = self.font(22)
+        fm = QFontMetrics(f)
+        p.setFont(f)
+        hx = x + 160 * u + fm.horizontalAdvance("//  CLAUDE CODE") + 34 * u
+        limit = self.W - 64 * u - cw - 50 * u
+        for i, (sid, sess) in enumerate(live):
+            br = self.branch(sess["cwd"])
+            proj = os.path.basename(sess["cwd"].rstrip("/"))
+            mark = 22 * u if len(live) > 1 else 0
+            w = fm.horizontalAdvance(f"//  {proj}" + (f" @ {br}" if br else "")) + mark
+            if hx + w > limit:
+                p.setPen(with_alpha(CYAN, 150))
+                p.drawText(QPointF(hx, 90 * u), f"//  +{len(live) - i}")
+                break
+            p.setPen(with_alpha(CYAN, 150))
+            p.drawText(QPointF(hx, 90 * u), "//")
+            hx += fm.horizontalAdvance("//  ")
+            if mark:  # the session's track colour, as marked in the activity stream
+                p.fillRect(QRectF(hx, 73 * u, 6 * u, 22 * u), self.sid_colors.get(sid, CYAN))
+                hx += mark
+            p.setPen(with_alpha(QColor("#e8f4ff") if sess["state"] == "working" else AMBER, 225))
+            p.drawText(QPointF(hx, 90 * u), proj)
+            hx += fm.horizontalAdvance(proj)
+            if br:
+                p.setPen(with_alpha(CYAN, 150))
+                p.drawText(QPointF(hx, 90 * u), " @ ")
+                hx += fm.horizontalAdvance(" @ ")
+                p.setPen(with_alpha(GREEN, 210))
+                p.drawText(QPointF(hx, 90 * u), br)
+                hx += fm.horizontalAdvance(br)
+            hx += 34 * u
 
     def draw_plan(self, p, now, x0, y0, x1):
         """The session's plan as a checklist. Returns the y where it ends."""
@@ -720,7 +1023,7 @@ class HUD(QOpenGLWidget):
             sw = (bx1 - bx0) / n
             st = items[k].get("status")
             col = with_alpha(GREEN, 200) if st == "completed" else \
-                with_alpha(AMBER, 150 + 100 * (int(now * 2) % 2)) if st == "in_progress" else QColor(40, 70, 120, 90)
+                with_alpha(AMBER, 150 + 100 * (int(now * 2) % 2)) if st == "in_progress" else T(40, 70, 120, 90)
             p.fillRect(QRectF(bx0 + k * sw, y0 + 38 * u, max(1, sw - 3 * u), 12 * u), col)
 
         lh, maxrows = 42 * u, 8
@@ -740,7 +1043,7 @@ class HUD(QOpenGLWidget):
             box = QRectF(x0 + 32 * u, y - 19 * u, 20 * u, 20 * u)
             if st == "completed":
                 p.fillRect(box, with_alpha(GREEN, 170))
-                col, text = with_alpha(QColor("#9fb4d8"), 130), i.get("text") or i.get("active")
+                col, text = with_alpha(T("#9fb4d8"), 130), i.get("text") or i.get("active")
             elif st == "in_progress":
                 pulse = 0.5 + 0.5 * math.sin(now * 5)
                 p.setPen(QPen(AMBER, 2 * u))
@@ -750,10 +1053,10 @@ class HUD(QOpenGLWidget):
                 p.fillRect(QRectF(x0 + 14 * u, y - 24 * u, 5 * u, 30 * u), AMBER)
                 col, text = QColor("#ffffff"), i.get("active") or i.get("text")
             else:
-                p.setPen(QPen(QColor(110, 140, 190, 150), 1.6 * u))
+                p.setPen(QPen(T(110, 140, 190, 150), 1.6 * u))
                 p.setBrush(Qt.BrushStyle.NoBrush)
                 p.drawRect(box)
-                col, text = with_alpha(QColor("#dfe9ff"), 170), i.get("text") or i.get("active")
+                col, text = with_alpha(T("#dfe9ff"), 170), i.get("text") or i.get("active")
             ff = QFont(f)
             ff.setStrikeOut(st == "completed")
             p.setFont(ff)
@@ -763,10 +1066,10 @@ class HUD(QOpenGLWidget):
         rest = len(items) - start - len(shown)
         if rest > 0:
             p.setFont(f)
-            p.setPen(with_alpha(QColor("#9fb4d8"), 130))
+            p.setPen(with_alpha(T("#9fb4d8"), 130))
             p.drawText(QPointF(x0 + 70 * u, y), f"▼ {rest} more")
             y += lh
-        p.setPen(QPen(QColor(79, 216, 255, 50), max(1, u)))
+        p.setPen(QPen(T(79, 216, 255, 50), max(1, u)))
         p.drawLine(QLineF(x0 + 30 * u, y - 6 * u, x1 - 30 * u, y - 6 * u))
         return y
 
@@ -781,6 +1084,7 @@ class HUD(QOpenGLWidget):
         lh = 44 * u
         rows = max(1, int((y1 - y0 - 120 * u) / lh))
         evs = [e for e in self.events if e.get("kind") != "DONE"][-rows:]
+        multi = len({e.get("sid") for e in evs if e.get("sid")}) > 1
         f = self.font(21)
         fm = QFontMetrics(f)
         p.setFont(f)
@@ -790,7 +1094,7 @@ class HUD(QOpenGLWidget):
             alpha = 255 if age_rank == 0 else max(60, 210 - age_rank * 9)
             c = QColor(KIND_COLORS.get(e.get("kind"), "#9fb4d8"))
             ts = time.strftime("%H:%M:%S", time.localtime(e.get("ts", now)))
-            p.setPen(with_alpha(QColor("#6b84ad"), alpha))
+            p.setPen(with_alpha(T("#6b84ad"), alpha))
             p.drawText(QPointF(x0 + 30 * u, y), ts)
             p.setPen(with_alpha(c, alpha))
             p.drawText(QPointF(x0 + 170 * u, y), e.get("kind", "")[:6])
@@ -799,16 +1103,18 @@ class HUD(QOpenGLWidget):
             born = e.get("born", 0)
             if born and now - born < 0.7:
                 detail = detail[: int(len(detail) * (now - born) / 0.7)] + ("█" if int(now * 12) % 2 else "")
-            p.setPen(with_alpha(QColor("#dfe9ff"), alpha))
+            p.setPen(with_alpha(T("#dfe9ff"), alpha))
             p.drawText(QPointF(x0 + 290 * u, y), detail)
             if age_rank == 0:
                 p.fillRect(QRectF(x0 + 14 * u, y - 24 * u, 5 * u, 30 * u), c)
+            if multi and e.get("sid") in self.sid_colors:  # which session's track this step is on
+                p.fillRect(QRectF(x0 + 23 * u, y - 20 * u, 3 * u, 24 * u), with_alpha(self.sid_colors[e["sid"]], alpha))
             if e.get("tool"):  # how long it took, or a live timer while it runs
                 running = "dur" not in e
                 sec = self.elapsed(e, now)
                 if running or sec >= 1:
                     txt = f"{SPINNER[int(now * 6) % 4]} {fmt_dur(sec, True)}" if running else fmt_dur(sec)
-                    p.setPen(with_alpha(c if running else QColor("#6b84ad"), alpha if not running else 255))
+                    p.setPen(with_alpha(c if running else T("#6b84ad"), alpha if not running else 255))
                     p.drawText(QPointF(x1 - 30 * u - fm.horizontalAdvance(txt), y), txt)
             y += lh
 
@@ -825,27 +1131,41 @@ class HUD(QOpenGLWidget):
         p.drawText(QPointF(x0 + 30 * u, y0 + 120 * u), "ELAPSED")
         p.drawText(QPointF(x0 + 470 * u, y0 + 120 * u), "OPERATIONS")
         p.setFont(self.font(60, True))
-        p.setPen(QColor("#e8f4ff"))
+        p.setPen(T("#e8f4ff"))
         p.drawText(QPointF(x0 + 30 * u, y0 + 190 * u), f"T+{el // 3600:02d}:{el // 60 % 60:02d}:{el % 60:02d}")
         p.drawText(QPointF(x0 + 470 * u, y0 + 190 * u), f"{len(evs):04d}")
+
+        # lines changed this turn, and in how many files
+        add, rm, files = self.code_delta()
+        f = self.font(22, True)
+        fm = QFontMetrics(f)
+        p.setFont(self.font(18))
+        p.setPen(with_alpha(CYAN, 150))
+        p.drawText(QPointF(x0 + 30 * u, y0 + 240 * u), "CODE")
+        dx = x0 + 120 * u
+        p.setFont(f)
+        for txt, col in ((f"+{add}", GREEN), (f"−{rm}", RED), (f"·  {len(files)} FILE{'S' * (len(files) != 1)}", T("#6b84ad"))):
+            p.setPen(col)
+            p.drawText(QPointF(dx, y0 + 240 * u), txt)
+            dx += fm.horizontalAdvance(txt) + 26 * u
 
         counts = {k: 0 for k in BAR_KINDS}
         for e in evs:
             if e.get("kind") in counts:
                 counts[e["kind"]] += 1
         mx = max(1, max(counts.values()))
-        y = y0 + 270 * u
+        y = y0 + 305 * u
         p.setFont(self.font(19))
         for k in BAR_KINDS:
             c = QColor(KIND_COLORS[k])
             p.setPen(with_alpha(c, 220))
             p.drawText(QPointF(x0 + 30 * u, y), k)
             bx, bw = x0 + 180 * u, (x1 - x0) - 320 * u
-            p.fillRect(QRectF(bx, y - 16 * u, bw, 14 * u), QColor(40, 70, 120, 70))
+            p.fillRect(QRectF(bx, y - 16 * u, bw, 14 * u), T(40, 70, 120, 70))
             segs = int(40 * counts[k] / mx)
             for s in range(segs):
                 p.fillRect(QRectF(bx + s * bw / 40, y - 16 * u, bw / 40 - 3 * u, 14 * u), with_alpha(c, 160 + 90 * (s == segs - 1)))
-            p.setPen(QColor("#dfe9ff"))
+            p.setPen(T("#dfe9ff"))
             p.drawText(QPointF(x1 - 110 * u, y), f"{counts[k]:>3}")
             y += 46 * u
 
@@ -861,17 +1181,17 @@ class HUD(QOpenGLWidget):
         p.setFont(f)
         y += 44 * u
         if not timed:
-            p.setPen(with_alpha(QColor("#6b84ad"), 160))
+            p.setPen(with_alpha(T("#6b84ad"), 160))
             p.drawText(QPointF(x0 + 30 * u, y), "—  every step under a second")
             y += 40 * u
         for sec, e in timed:
             running = "dur" not in e
             c = QColor(KIND_COLORS.get(e.get("kind"), "#9fb4d8"))
-            p.setPen(QColor("#e8f4ff"))
+            p.setPen(T("#e8f4ff"))
             p.drawText(QPointF(x0 + 30 * u, y), (SPINNER[int(now * 6) % 4] + " " + fmt_dur(sec, True)) if running else fmt_dur(sec))
             p.setPen(with_alpha(c, 220))
             p.drawText(QPointF(x0 + 180 * u, y), e.get("kind", "")[:6])
-            p.setPen(with_alpha(QColor("#dfe9ff"), 190))
+            p.setPen(with_alpha(T("#dfe9ff"), 190))
             p.drawText(QPointF(x0 + 300 * u, y), fm.elidedText(e.get("detail", ""), Qt.TextElideMode.ElideRight, int(x1 - x0 - 340 * u)))
             y += 40 * u
 
@@ -881,7 +1201,7 @@ class HUD(QOpenGLWidget):
         p.setPen(with_alpha(CYAN, 150))
         p.drawText(QPointF(gx, gy - 4 * u), "SYNAPTIC ACTIVITY  /  60s")
         gy += 14 * u
-        p.setPen(QPen(QColor(40, 80, 140, 90), max(1, u)))
+        p.setPen(QPen(T(40, 80, 140, 90), max(1, u)))
         for i in range(7):
             p.drawLine(QLineF(gx + gw * i / 6, gy, gx + gw * i / 6, gy + gh))
         for i in range(5):
@@ -937,7 +1257,7 @@ class HUD(QOpenGLWidget):
                 if sec >= 1 or not running:
                     t = f"{SPINNER[int(now * 6) % 4]} {fmt_dur(sec, True)}" if running else f"✓ {fmt_dur(sec)}"
                     p.setFont(self.font(26))
-                    p.setPen(with_alpha(QColor("#e8f4ff") if running else QColor("#6b84ad"), 230))
+                    p.setPen(with_alpha(T("#e8f4ff") if running else T("#6b84ad"), 230))
                     p.drawText(QPointF(cx + fm.horizontalAdvance("█") + 22 * u, y + 62 * u), t)
 
     def typed(self, ev, text, now, slot="status"):
@@ -1019,9 +1339,80 @@ class HUD(QOpenGLWidget):
         a = 255 * (1 - ease((t - 0.9) / 0.7)) if t > 0.9 else 255 * ((int(t * 14) % 2) or t > 0.4)
         self.big_text(p, "LINK ESTABLISHED", CYAN, a, 72)
 
+    def code_delta(self):
+        """(lines added, lines removed, {file}) across this turn's edits."""
+        add = rm = 0
+        files = set()
+        for e in self.events:
+            if e.get("add") or e.get("rm"):
+                add += e.get("add", 0)
+                rm += e.get("rm", 0)
+                files.add(e.get("file") or e.get("detail"))
+        return add, rm, files
+
+    def make_summary(self, now):
+        """The end-of-task report card, or None when the turn did nothing worth reporting."""
+        steps = [e for e in self.events if e.get("tool")]
+        if not steps:
+            return None
+        add, rm, files = self.code_delta()
+        longest = max(steps, key=lambda e: self.elapsed(e, now))
+        return {"elapsed": max(0, int(now - self.turn_start)), "steps": len(steps), "add": add, "rm": rm,
+                "files": len(files), "faults": sum(1 for e in self.events if e.get("kind") == "FAULT"),
+                "plan": (sum(1 for i in self.plan if i.get("status") == "completed"), len(self.plan)) if self.plan else None,
+                "longest": (longest.get("kind", ""), longest.get("detail", ""), self.elapsed(longest, now))}
+
     def draw_outro(self, p, t):
         a = 255 if t > 0.25 else 255 * (int(t * 20) % 2)
-        self.big_text(p, self.close_msg, self.close_color, a)
+        if not self.summary:
+            self.big_text(p, self.close_msg, self.close_color, a)
+            return
+        u, sm = self.u, self.summary
+        f = self.font(96, True)
+        f.setLetterSpacing(QFont.SpacingType.PercentageSpacing, 125)
+        fm = QFontMetrics(f)
+        y = self.cy - 40 * u
+        fade = 1 - ease((t - (self.crt_at - 0.4)) / 0.4) if t > self.crt_at - 0.4 else 1
+        band = QRectF(0, y - fm.ascent() - 50 * u, self.W, fm.ascent() + 260 * u)
+        p.fillRect(band, QColor(0, 8, 4, int(242 * fade)))
+        p.setPen(QPen(with_alpha(GREEN, 180 * fade), 2 * u))
+        p.drawLine(QLineF(0, band.top(), self.W, band.top()))
+        p.drawLine(QLineF(0, band.bottom(), self.W, band.bottom()))
+        p.setFont(f)
+        p.setPen(with_alpha(GREEN, a * fade))
+        p.drawText(QPointF(self.cx - fm.horizontalAdvance(self.close_msg) / 2, y), self.close_msg)
+
+        # the numbers count up, then hold
+        k = ease((t - 0.3) / 0.9)
+        el = sm["elapsed"]
+        parts = [(f"T+{el // 3600:02d}:{el // 60 % 60:02d}:{el % 60:02d}", "#e8f4ff"),
+                 (f"{round(sm['steps'] * k)} STEPS", "#e8f4ff"),
+                 (f"{sm['files']} FILES", "#e8f4ff"),
+                 (f"+{round(sm['add'] * k)}", GREEN.name()), (f"−{round(sm['rm'] * k)}", RED.name()),
+                 (f"{sm['faults']} FAULT{'S' * (sm['faults'] != 1)}", RED.name() if sm["faults"] else "#6b84ad")]
+        if sm["plan"]:
+            parts.insert(3, (f"PLAN {sm['plan'][0]}/{sm['plan'][1]}", GREEN.name()))
+        sf = self.font(30, True)
+        sfm = QFontMetrics(sf)
+        sep = "   ·   "
+        total = sum(sfm.horizontalAdvance(t_) for t_, _ in parts) + sfm.horizontalAdvance(sep) * (len(parts) - 1)
+        x = self.cx - total / 2
+        p.setFont(sf)
+        for i, (txt, col) in enumerate(parts):
+            if i:
+                p.setPen(with_alpha(T("#6b84ad"), 200 * fade))
+                p.drawText(QPointF(x, y + 90 * u), sep)
+                x += sfm.horizontalAdvance(sep)
+            p.setPen(with_alpha(QColor(col), 240 * fade))
+            p.drawText(QPointF(x, y + 90 * u), txt)
+            x += sfm.horizontalAdvance(txt)
+        kind, detail, sec = sm["longest"]
+        lf = self.font(22)
+        lfm = QFontMetrics(lf)
+        line = f"LONGEST STEP   {kind}  " + lfm.elidedText(detail, Qt.TextElideMode.ElideRight, int(900 * u)) + f"   {fmt_dur(sec)}"
+        p.setFont(lf)
+        p.setPen(with_alpha(T("#9fb4d8"), 200 * fade * min(1, max(0, (t - 0.8) / 0.4))))
+        p.drawText(QPointF(self.cx - lfm.horizontalAdvance(line) / 2, y + 150 * u), line)
 
     def draw_crt_off(self, p, f):
         p.fillRect(0, 0, self.W, self.H, QColor("#000000"))

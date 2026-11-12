@@ -10,6 +10,7 @@ import os
 import sys
 import tempfile
 import time
+import types
 import unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -205,7 +206,9 @@ class HudTiming(unittest.TestCase):
 
     def hud(self):
         h = type("S", (), {})()
-        h.running, h.ended, h.waiting_since = [], {}, None
+        h.running, h.ended, h.waiting_since, h.events, h.plan, h.turn_start = [], {}, None, [], None, 0
+        for m in ("close_step", "elapsed", "code_delta"):
+            setattr(h, m, types.MethodType(getattr(self.HUD, m), h))
         return h
 
     def test_pairs_by_id_and_times_it(self):
@@ -217,8 +220,9 @@ class HudTiming(unittest.TestCase):
 
     def test_an_end_arriving_first_is_kept_for_its_step(self):
         h = self.hud()
-        self.HUD.finish(h, {"ts": 104.0, "kind": "END", "id": "b", "tool": "Read"})
-        self.assertEqual(h.ended, {"b": 104.0})
+        end = {"ts": 104.0, "kind": "END", "id": "b", "tool": "Read", "add": 3}
+        self.HUD.finish(h, end)
+        self.assertEqual(h.ended, {"b": end})  # whole, so its line counts survive the wait
 
     def test_without_ids_it_pairs_the_oldest_call_of_the_same_tool(self):
         h = self.hud()
@@ -236,6 +240,118 @@ class HudTiming(unittest.TestCase):
                                           "reason": None, "accent": None})(), 110.0)
         self.HUD.finish(h, {"ts": 111.0, "kind": "END", "id": "c"})
         self.assertAlmostEqual(ev["dur"], 3.0)
+
+
+    def test_line_counts_reach_the_step_and_the_summary(self):
+        h = self.hud()
+        a = {"ts": 1.0, "id": "e1", "tool": "Edit", "kind": "WRITE", "detail": "a.py"}
+        b = {"ts": 2.0, "id": "e2", "tool": "Bash", "kind": "EXEC", "detail": "Run tests"}
+        h.running += [a, b]
+        h.events += [a, b, {"ts": 3.0, "kind": "FAULT", "detail": "EXEC failed"}]
+        self.HUD.finish(h, {"ts": 1.5, "kind": "END", "id": "e1", "add": 7, "rm": 2, "file": "a.py"})
+        self.HUD.finish(h, {"ts": 12.0, "kind": "END", "id": "e2"})
+        self.assertEqual(self.HUD.code_delta(h), (7, 2, {"a.py"}))
+        sm = self.HUD.make_summary(h, 20.0)
+        self.assertEqual((sm["steps"], sm["add"], sm["rm"], sm["files"], sm["faults"]), (2, 7, 2, 1, 1))
+        self.assertEqual(sm["longest"][:2], ("EXEC", "Run tests"))
+
+    def test_no_summary_for_a_turn_without_steps(self):
+        self.assertIsNone(self.HUD.make_summary(self.hud(), 5.0))
+
+
+class Delta(unittest.TestCase):
+    """Lines added and removed by each edit, carried on its END event."""
+
+    def setUp(self):
+        Lifecycle.setUp(self)
+
+    def end_of(self, tool, inp, resp=None):
+        run_hook({"hook_event_name": "PostToolUse", "session_id": "t", "tool_name": tool, "cwd": "/p",
+                  "tool_use_id": "x", "tool_input": inp, "tool_response": resp})
+        e = [e for e in events() if e["kind"] == "END"][-1]
+        return e.get("add", 0), e.get("rm", 0), e.get("file", "")
+
+    def test_edit(self):
+        self.assertEqual(self.end_of("Edit", {"file_path": "/p/a.py", "old_string": "a\nb\nc",
+                                              "new_string": "a\nB\nc\nd"}), (2, 1, "a.py"))
+
+    def test_the_reported_patch_wins(self):
+        patch = {"structuredPatch": [{"lines": [" ctx", "-old", "+new", "+more"]}]}
+        self.assertEqual(self.end_of("Edit", {"file_path": "/p/a.py", "old_string": "x", "new_string": "y"}, patch),
+                         (2, 1, "a.py"))
+
+    def test_write_and_multiedit(self):
+        self.assertEqual(self.end_of("Write", {"file_path": "/p/n.py", "content": "1\n2\n3\n"}), (3, 0, "n.py"))
+        self.assertEqual(self.end_of("MultiEdit", {"file_path": "/p/m.py", "edits": [
+            {"old_string": "a", "new_string": "b"}, {"old_string": "c", "new_string": "c\nd"}]}), (2, 1, "m.py"))
+
+    def test_other_tools_change_nothing(self):
+        self.assertEqual(self.end_of("Bash", {"command": "ls"}), (0, 0, ""))
+
+
+class Sessions(unittest.TestCase):
+    def setUp(self):
+        Lifecycle.setUp(self)
+
+    def test_events_carry_their_session(self):
+        run_hook({"hook_event_name": "PreToolUse", "session_id": "abc", "tool_name": "Read",
+                  "tool_input": {"file_path": "/p/x"}})
+        self.assertEqual(events()[-1]["sid"], "abc")
+
+    def test_a_prompt_records_the_project_transcript_and_turn(self):
+        run_hook({"hook_event_name": "UserPromptSubmit", "session_id": "abc", "cwd": "/p/proj",
+                  "transcript_path": "/p/t.jsonl"})
+        with open(os.path.join(hook.STATE_DIR, "m-abc.json")) as f:
+            self.assertEqual(json.load(f), {"cwd": "/p/proj", "transcript": "/p/t.jsonl"})
+        self.assertTrue(os.path.exists(os.path.join(hook.STATE_DIR, "turn-abc")))
+
+
+class HudReaders(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        try:
+            cls.hud = importlib.import_module("hud")
+        except ImportError as e:
+            raise unittest.SkipTest(f"PyQt6 not available: {e}")
+
+    def test_git_branch(self):
+        d = tempfile.mkdtemp()
+        os.makedirs(os.path.join(d, ".git"))
+        with open(os.path.join(d, ".git", "HEAD"), "w") as f:
+            f.write("ref: refs/heads/feature/plan\n")
+        os.makedirs(os.path.join(d, "src", "deep"))
+        self.assertEqual(self.hud.git_branch(os.path.join(d, "src", "deep")), "plan")
+        with open(os.path.join(d, ".git", "HEAD"), "w") as f:
+            f.write("0123456789abcdef\n")
+        self.assertEqual(self.hud.git_branch(d), "0123456")
+        self.assertEqual(self.hud.git_branch(tempfile.mkdtemp()), "")
+
+    def test_context_reads_the_newest_main_thread_usage(self):
+        path = os.path.join(tempfile.mkdtemp(), "t.jsonl")
+        rows = [{"type": "assistant", "message": {"model": "m", "usage": {"input_tokens": 10, "output_tokens": 5}}},
+                {"type": "assistant", "message": {"model": "m", "usage": {
+                    "input_tokens": 4, "cache_read_input_tokens": 90000, "cache_creation_input_tokens": 6,
+                    "output_tokens": 990}}},
+                {"type": "assistant", "isSidechain": True, "message": {"usage": {"input_tokens": 999999}}},
+                {"type": "user", "message": {"content": "hi"}}]
+        with open(path, "w") as f:
+            f.write("".join(json.dumps(r) + "\n" for r in rows) + '{"truncated')
+        self.assertEqual(self.hud.read_context(path), (91000, "m"))
+        self.assertIsNone(self.hud.read_context("/nonexistent"))
+
+    def test_context_window(self):
+        self.assertEqual(self.hud.context_window(91000, "claude-x"), 200_000)
+        self.assertEqual(self.hud.context_window(250_000, "claude-x"), 1_000_000)
+        self.assertEqual(self.hud.context_window(1000, "claude-x[1m]"), 1_000_000)
+
+    def test_theme_hue_keeps_brightness(self):
+        c = self.hud.QColor("#4fd8ff")
+        self.hud.HUE = 34
+        try:
+            t = self.hud.T("#4fd8ff")
+        finally:
+            self.hud.HUE = None
+        self.assertEqual((t.hue(), t.value(), t.saturation()), (34, c.value(), c.saturation()))
 
 
 class Typing(unittest.TestCase):

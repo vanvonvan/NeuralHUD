@@ -3,6 +3,7 @@
 or waiting for the user (and why), logs tool calls and when they finish for the
 activity stream, keeps the session's plan for the checklist panel, and starts
 the HUD daemon when work begins. Never fails the hook."""
+import difflib
 import fcntl
 import json
 import os
@@ -15,6 +16,8 @@ TS = time.time()  # hook start time, used to order async hooks that finish out o
 STATE_DIR = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "claude-neural")
 DAEMON = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hud.py")
 EVENTS = os.path.join(STATE_DIR, "events.jsonl")
+SID = "default"  # this event's session, set in main()
+EDIT_TOOLS = ("Edit", "MultiEdit", "Write", "NotebookEdit")
 
 
 def rel(path, cwd):
@@ -71,7 +74,7 @@ def clean(text, n=160):
 
 def emit(kind, detail, **extra):
     """Append one line to the activity log. `id` and `tool` pair a step with its END."""
-    ev = {"ts": TS, "kind": kind, "detail": clean(detail)}
+    ev = {"ts": TS, "kind": kind, "detail": clean(detail), "sid": SID}
     ev.update({k: v for k, v in extra.items() if v})
     with open(EVENTS, "a") as f:
         f.write(json.dumps(ev) + "\n")
@@ -150,6 +153,50 @@ def update_plan(path, tool, inp, resp):
     locked_json(path, update)
 
 
+def line_delta(old, new):
+    """(lines added, lines removed) turning text old into new."""
+    add = rm = 0
+    sm = difflib.SequenceMatcher(None, str(old or "").splitlines(), str(new or "").splitlines(), autojunk=False)
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if tag in ("replace", "delete"):
+            rm += i2 - i1
+        if tag in ("replace", "insert"):
+            add += j2 - j1
+    return add, rm
+
+
+def edit_delta(tool, inp, resp):
+    """(added, removed) lines for a finished edit. Prefers the patch Claude Code reports,
+    else works it out from the tool's input."""
+    if isinstance(resp, dict) and isinstance(resp.get("structuredPatch"), list):
+        lines = [ln for h in resp["structuredPatch"] if isinstance(h, dict) for ln in h.get("lines") or []]
+        return sum(1 for ln in lines if ln.startswith("+")), sum(1 for ln in lines if ln.startswith("-"))
+    if tool == "Edit":
+        add, rm = line_delta(inp.get("old_string"), inp.get("new_string"))
+        return add, rm
+    if tool == "MultiEdit":
+        pairs = [line_delta(e.get("old_string"), e.get("new_string")) for e in inp.get("edits") or [] if isinstance(e, dict)]
+        return sum(a for a, _ in pairs), sum(r for _, r in pairs)
+    if tool == "Write":
+        return len(str(inp.get("content") or "").splitlines()), 0
+    if tool == "NotebookEdit":
+        return len(str(inp.get("new_source") or "").splitlines()), 0
+    return 0, 0
+
+
+def write_meta(data, first_prompt):
+    """The session's project dir and transcript (for the header and the context gauge),
+    and its own turn start, so several sessions keep separate tracks."""
+    meta = os.path.join(STATE_DIR, f"m-{SID}.json")
+    if first_prompt or not os.path.exists(meta):
+        with open(meta + ".tmp", "w") as f:
+            json.dump({"cwd": data.get("cwd", ""), "transcript": data.get("transcript_path", "")}, f)
+        os.replace(meta + ".tmp", meta)
+    if first_prompt:
+        with open(os.path.join(STATE_DIR, f"turn-{SID}"), "w") as f:
+            f.write(str(TS))
+
+
 def set_state(path, state):
     fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
     with os.fdopen(fd, "r+") as f:
@@ -172,6 +219,7 @@ def daemon_running():
 
 
 def main():
+    global SID
     try:
         data = json.load(sys.stdin)
     except ValueError:
@@ -179,8 +227,9 @@ def main():
     event = data.get("hook_event_name", "")
     tool = str(data.get("tool_name", ""))
     cwd = data.get("cwd", "")
-    sid = "".join(ch for ch in str(data.get("session_id", "default")) if ch.isalnum() or ch == "-")
+    sid = SID = "".join(ch for ch in str(data.get("session_id", "default")) if ch.isalnum() or ch == "-")
     os.makedirs(STATE_DIR, exist_ok=True)
+    write_meta(data, event == "UserPromptSubmit")
     path = os.path.join(STATE_DIR, "s-" + sid)
     reason = os.path.join(STATE_DIR, "w-" + sid)
     inp = data.get("tool_input") or {}
@@ -221,9 +270,14 @@ def main():
         emit("LINK", "directive received")
     else:  # the step finished: lets the HUD time it
         if tool != "AskUserQuestion":
-            emit("END", tool, id=tid, tool=tool)
+            add = rm = 0
+            if tool in EDIT_TOOLS and event == "PostToolUse":
+                add, rm = edit_delta(tool, inp, data.get("tool_response"))
+            emit("END", tool, id=tid, tool=tool, add=add, rm=rm,
+                 file=rel(inp.get("file_path") or inp.get("notebook_path"), cwd) if add or rm else "")
         if event == "PostToolUseFailure":
-            emit("FAULT", f"{tool} failed")
+            err = clean(data.get("error") or "", 90)
+            emit("FAULT", f"{describe(tool, inp, cwd)[0]} failed" + (f": {err}" if err else ""))
         elif tool in PLAN_TOOLS:
             update_plan(os.path.join(STATE_DIR, f"plan-{sid}.json"), tool, inp, data.get("tool_response"))
     set_state(path, "working")
