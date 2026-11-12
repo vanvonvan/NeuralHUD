@@ -1,0 +1,137 @@
+<p align="center">
+  <img src="assets/banner.png" alt="Neural HUD" width="100%">
+</p>
+
+<p align="center">
+  <b>A sci-fi "neural link" display for a spare monitor that comes alive while
+  <a href="https://claude.com/claude-code">Claude Code</a> is working, and powers down when it's done.</b><br>
+  Signals cascade through a rotating 3D network, colour-coded by what Claude is
+  doing, while every step it takes is typed out live.
+</p>
+
+<p align="center">
+  <img alt="Claude Code hooks" src="https://img.shields.io/badge/Claude%20Code-hooks-ffb347">
+  <img alt="Python 3.10+" src="https://img.shields.io/badge/Python-3.10%2B-4fd8ff">
+  <img alt="PyQt6 OpenGL" src="https://img.shields.io/badge/PyQt6-OpenGL-6dff9e">
+  <img alt="X11 / XWayland" src="https://img.shields.io/badge/X11-XWayland-b18cff">
+  <img alt="License GPL-2.0-or-later" src="https://img.shields.io/badge/License-GPL--2.0--or--later-blue">
+</p>
+
+---
+
+## The HUD
+
+<p align="center">
+  <img src="assets/screenshot.png" alt="Neural HUD mid-task" width="100%">
+</p>
+
+<p align="center">
+  <sub>Rendered offscreen by <code>tools/screenshot.py</code> from a scripted turn — the real
+  drawing code, caught mid-keystroke on the status line.</sub>
+</p>
+
+## Features
+
+- 🧠 **A rotating 3D neural network** in a ring of HUD instruments. Signals cascade through it,
+  colour-coded by what Claude is doing: cyan for reading files, magenta for editing, amber for
+  running commands, green for searching, violet for subagents, yellow for MCP tools.
+- ⌨️ **A live status line** under the core that types out Claude's current step key by key, with
+  a blinking block cursor, as if someone were at the terminal.
+- 📜 **Activity stream**: a log of Claude's actual steps, appearing as they happen.
+- 📈 **Telemetry**: elapsed time, operation count, a breakdown by kind of action and an
+  activity trace for the last 60 seconds.
+- 🔌 **Opens and closes itself**: "LINK ESTABLISHED" when work starts, "TASK COMPLETE" with a
+  CRT power-off when Claude finishes, "AWAITING OPERATOR" when Claude needs your approval or
+  an answer. It comes back once you've approved.
+- 🫥 **Never gets in the way**: the window takes no keyboard focus and lets every click through, so
+  your other screens work normally. An optional keyboard shortcut closes it until your next prompt.
+- 🪶 **Light**: runs on the GPU, about 10% of one CPU core at 3072×1728.
+
+## Requirements
+
+- Linux with X11, or Wayland with XWayland (tested on GNOME Wayland)
+- Python 3.10+ with PyQt6 (`python3-pyqt6`, or `pip install PyQt6`)
+- `xrandr`
+- A second monitor (a small USB/portable one is perfect)
+
+## Install
+
+```sh
+git clone git@github.com:vanvonvan/NeuralHUD.git
+cd NeuralHUD
+
+./install.sh                                   # uses your smallest non-primary monitor
+./install.sh --monitor HDMI-1                  # or pick one by xrandr output name
+./install.sh --monitor ARZOPA                  # or by text in its EDID (usually the brand)
+./install.sh --shortcut '<Super><Alt>n'        # GNOME: add a close shortcut
+```
+
+`make install ARGS="--monitor HDMI-1"` does the same.
+
+The installer copies `hud.py` and `hook.py` to `~/.claude/neural-hud/` and adds hooks to
+`~/.claude/settings.json`, after writing a backup to `settings.json.bak-neural-hud`. Your
+existing settings and hooks are kept. Running it again replaces the previous install, so
+after a `git pull` just run it again.
+
+Close the HUD by hand with `python3 ~/.claude/neural-hud/hud.py --close` (that is what the
+shortcut runs). It stays closed until your next prompt.
+
+## Uninstall
+
+```sh
+./uninstall.sh        # or: make uninstall
+```
+
+This removes the hooks (backing up `settings.json` first) and `~/.claude/neural-hud/`. A GNOME
+shortcut added by the installer stays: remove it in **Settings → Keyboard → Custom Shortcuts**.
+
+## How it works
+
+`hook.py` runs (asynchronously) on Claude Code hook events and keeps a little state in
+`$XDG_RUNTIME_DIR/claude-neural/`:
+
+| Event | Effect |
+|---|---|
+| `UserPromptSubmit`, `PostToolUse`, `PostToolUseFailure` | session is *working*; start the HUD if needed |
+| `PreToolUse` | log the step to the activity stream |
+| `PermissionRequest`, `Notification` (permission prompt), `AskUserQuestion` | session is *waiting* |
+| `Stop`, `StopFailure`, `SessionEnd` | session is *done* |
+
+`hud.py` shows while any session is working and plays its outro when none is. Several Claude
+Code sessions at once are fine. Hooks run asynchronously and can finish out of order, so each
+state change carries its hook's start time and an older one never overwrites a newer one.
+A session silent for 20 minutes is treated as finished.
+
+Bash steps appear in the stream as their description, never the raw command, and file paths
+are shown relative to the project.
+
+## Development
+
+```sh
+make test         # headless: hook events, state ordering, status-line typing
+make screenshot   # re-render assets/screenshot.png offscreen
+make art          # regenerate the icon, logo, banner and social preview (needs pycairo)
+```
+
+The tests and the screenshot use a private temporary state directory, so they never disturb a
+HUD or a Claude Code session running on the same machine.
+
+## Project layout
+
+```
+hud.py             the display: a frameless, click-through OpenGL window
+hook.py            the Claude Code hook that feeds it
+install.sh         copies both to ~/.claude/neural-hud and registers the hooks
+uninstall.sh       undoes install.sh
+tests/             headless unit tests
+tools/             art and screenshot generators
+assets/            README and repository art
+```
+
+## License
+
+GPL-2.0-or-later — see [LICENSE](LICENSE).
+
+---
+
+Unofficial fan project: not made, endorsed or supported by Anthropic.

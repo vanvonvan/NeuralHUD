@@ -1,0 +1,15 @@
+# Claude memory files (kept locally, never committed)
+memory/
+.claude-memory/
+
+# Local Claude Code settings (machine-specific paths / permissions)
+.claude/settings.local.json
+
+# Python bytecode
+__pycache__/
+*.pyc
+
+# Source art for assets (keep the big originals out of the repo)
+*.psd
+*.jpg
+*.jpeg
