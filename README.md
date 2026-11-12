@@ -120,6 +120,15 @@ after a `git pull` just run it again.
 Close the HUD by hand with `python3 ~/.claude/neural-hud/hud.py --close` (that is what the
 shortcut runs). It stays closed until your next prompt.
 
+### Over SSH
+
+The HUD draws on the monitors of the machine Claude Code runs on, from that machine's desktop
+session. When Claude Code runs in an SSH session there is no display to draw on, so the hook
+records the session as usual but doesn't start the HUD, and nothing errors. A HUD already open on
+that machine's desktop usually still shows the SSH session's steps (when both sessions share
+`XDG_RUNTIME_DIR`, as they do on systemd distros). On a server without PyQt6 or
+`xrandr`, `hud.py` says so in one line instead of failing.
+
 ## Uninstall
 
 ```sh

@@ -288,6 +288,11 @@ def main():
                 return
     except (OSError, ValueError):
         pass
+    # The HUD draws through X (XWayland on Wayland). Without a display, e.g. Claude Code run
+    # over SSH, there is nothing to draw on: skip the launch rather than start Qt for nothing
+    # on every step. The state is still recorded, so a HUD already on screen keeps up.
+    if not os.environ.get("DISPLAY"):
+        return
     if not daemon_running():
         subprocess.Popen([sys.executable, DAEMON], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                          stderr=open(os.path.join(STATE_DIR, "daemon.err"), "w"), start_new_session=True)

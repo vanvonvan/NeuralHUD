@@ -33,11 +33,17 @@ import time
 os.environ["QT_QPA_PLATFORM"] = "xcb"          # Wayland clients can't place windows
 os.environ["QT_ENABLE_HIGHDPI_SCALING"] = "0"  # work in real X pixels
 
-from PyQt6.QtCore import QLineF, QPointF, QRectF, Qt, QTimer
-from PyQt6.QtGui import (QBrush, QColor, QFont, QFontMetrics, QPainter, QPen,
-                         QPixmap, QRadialGradient, QPolygonF)
-from PyQt6.QtOpenGLWidgets import QOpenGLWidget
-from PyQt6.QtWidgets import QApplication
+try:
+    from PyQt6.QtCore import QLineF, QPointF, QRectF, Qt, QTimer
+    from PyQt6.QtGui import (QBrush, QColor, QFont, QFontMetrics, QPainter, QPen,
+                             QPixmap, QRadialGradient, QPolygonF)
+    from PyQt6.QtOpenGLWidgets import QOpenGLWidget
+    from PyQt6.QtWidgets import QApplication
+except ImportError:
+    if __name__ == "__main__":  # e.g. a server reached over SSH: say so once, don't trace back
+        sys.stderr.write("neural-hud: PyQt6 is not installed here, so the HUD cannot run on this machine.\n")
+        sys.exit(0)
+    raise
 
 STATE_DIR = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "claude-neural")
 LOCK = os.path.join(STATE_DIR, "daemon.lock")
@@ -83,7 +89,12 @@ AMBER = QColor("#ffb347")
 
 def xrandr_monitors():
     """Connected monitors: [{"name", "primary", "geo": (x, y, w, h)}]."""
-    out = subprocess.run(["xrandr"], capture_output=True, text=True).stdout
+    if not os.environ.get("DISPLAY"):
+        return []
+    try:
+        out = subprocess.run(["xrandr"], capture_output=True, text=True, timeout=5).stdout
+    except (OSError, subprocess.TimeoutExpired):  # no xrandr installed, or an unresponsive display
+        return []
     mons = []
     for line in out.splitlines():
         m = re.match(r"(\S+) connected( primary)?.*?(\d+)x(\d+)\+(\d+)\+(\d+)", line)
@@ -154,7 +165,11 @@ def list_monitors(want=""):
     """Print the connected monitors and the MONITOR= values that select each one."""
     mons = xrandr_monitors()
     if not mons:
-        print("no monitors found (is xrandr working? on Wayland it needs XWayland)")
+        if not os.environ.get("DISPLAY"):
+            print("no display here: DISPLAY isn't set (an SSH session?). The HUD only runs on the\n"
+                  "machine whose monitors it uses, from a terminal in its desktop session.")
+        else:
+            print("no monitors found: is xrandr installed? (on Wayland it needs XWayland)")
         return
     labels = {n: edid_label(d) for n, d in edids(mons).items()}
     # only offer a model name that really selects its monitor (and no other one first)

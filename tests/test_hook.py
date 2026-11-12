@@ -19,17 +19,26 @@ os.environ["XDG_RUNTIME_DIR"] = tempfile.mkdtemp(prefix="neural-hud-test-")
 hook = importlib.import_module("hook")  # reads XDG_RUNTIME_DIR at import
 
 
-def run_hook(payload):
-    """Run hook.main() on one event, with a fresh TS and the daemon launch stubbed out."""
+def run_hook(payload, display=":0"):
+    """Run hook.main() on one event, with a fresh TS and the daemon launch stubbed out.
+    display=None runs it as over SSH: no DISPLAY."""
     hook.TS = time.time()
     launched = []
-    real_popen, real_stdin = hook.subprocess.Popen, sys.stdin
+    real_popen, real_stdin, real_display = hook.subprocess.Popen, sys.stdin, os.environ.get("DISPLAY")
     hook.subprocess.Popen = lambda *a, **k: launched.append(a)
     sys.stdin = __import__("io").StringIO(json.dumps(payload))
+    if display:
+        os.environ["DISPLAY"] = display
+    else:
+        os.environ.pop("DISPLAY", None)
     try:
         hook.main()
     finally:
         hook.subprocess.Popen, sys.stdin = real_popen, real_stdin
+        if real_display is None:
+            os.environ.pop("DISPLAY", None)
+        else:
+            os.environ["DISPLAY"] = real_display
     return launched
 
 
@@ -107,6 +116,46 @@ class Lifecycle(unittest.TestCase):
         run_hook({"hook_event_name": "PreToolUse", "session_id": "t", "tool_name": "Grep",
                   "tool_input": {"pattern": "x" * 500}})
         self.assertEqual(len(events()[-1]["detail"]), 160)
+
+
+class NoDisplay(unittest.TestCase):
+    """Claude Code reached over SSH: no display, so no HUD, but no errors either."""
+
+    def setUp(self):
+        Lifecycle.setUp(self)
+
+    def test_the_hook_records_state_but_launches_nothing(self):
+        self.assertEqual(run_hook({"hook_event_name": "UserPromptSubmit", "session_id": "t"}, display=None), [])
+        self.assertEqual(run_hook({"hook_event_name": "PostToolUse", "session_id": "t", "tool_name": "Bash"},
+                                  display=None), [])
+        self.assertEqual(state(), "working")
+
+    def run_hud(self, *args, path=None, block_qt=False):
+        import subprocess
+        env = {k: v for k, v in os.environ.items() if k not in ("DISPLAY", "WAYLAND_DISPLAY")}
+        if path is not None:
+            env["PATH"] = path
+        code = ("import runpy, sys\n"
+                + ("sys.modules['PyQt6'] = None\n" if block_qt else "")
+                + f"sys.argv = ['hud.py'] + {list(args)!r}\n"
+                + f"runpy.run_path({os.path.join(ROOT, 'hud.py')!r}, run_name='__main__')")
+        return subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True, timeout=30)
+
+    def test_the_hud_exits_quietly(self):
+        r = self.run_hud()
+        self.assertEqual((r.returncode, r.stdout, r.stderr), (0, "", ""))
+
+    def test_no_xrandr_installed(self):
+        r = self.run_hud("--list-monitors", path="/nonexistent")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertNotIn("Traceback", r.stderr)
+        self.assertIn("no display", r.stdout)
+
+    def test_no_pyqt_installed(self):
+        r = self.run_hud(block_qt=True)
+        self.assertEqual(r.returncode, 0)
+        self.assertNotIn("Traceback", r.stderr)
+        self.assertIn("PyQt6 is not installed", r.stderr)
 
 
 class Timing(unittest.TestCase):
