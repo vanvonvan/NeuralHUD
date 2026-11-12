@@ -66,8 +66,6 @@ cd NeuralHUD
 ./install.sh --shortcut '<Super><Alt>n'        # GNOME: add a close shortcut
 ```
 
-`make install ARGS="--monitor HDMI-1"` does the same.
-
 The installer copies `hud.py` and `hook.py` to `~/.claude/neural-hud/` and adds hooks to
 `~/.claude/settings.json`, after writing a backup to `settings.json.bak-neural-hud`. Your
 existing settings and hooks are kept. Running it again replaces the previous install, so
@@ -79,7 +77,7 @@ shortcut runs). It stays closed until your next prompt.
 ## Uninstall
 
 ```sh
-./uninstall.sh        # or: make uninstall
+./uninstall.sh
 ```
 
 This removes the hooks (backing up `settings.json` first) and `~/.claude/neural-hud/`. A GNOME

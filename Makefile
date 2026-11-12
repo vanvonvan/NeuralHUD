@@ -1,16 +1,7 @@
-# Pass install options through ARGS, e.g.
-#   make install ARGS="--monitor HDMI-1 --shortcut '<Super><Alt>n'"
-ARGS ?=
+# Development tasks. To install or remove the HUD, use ./install.sh and
+# ./uninstall.sh directly: they take options (see README.md).
 
-.PHONY: install uninstall test art screenshot close
-
-# Copy hud.py and hook.py to ~/.claude/neural-hud and register the hooks in
-# ~/.claude/settings.json (a backup is written first).
-install:
-	./install.sh $(ARGS)
-
-uninstall:
-	./uninstall.sh
+.PHONY: test art screenshot close
 
 # Headless checks: hook events and state ordering, and the status-line typing.
 # No display and no Claude Code session needed; the real state dir is untouched.
