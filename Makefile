@@ -7,7 +7,7 @@
 MONITOR ?=
 SHORTCUT ?=
 
-.PHONY: install uninstall monitors test art screenshot close
+.PHONY: install uninstall monitors demo test art screenshot close
 
 # Copy hud.py and hook.py to ~/.claude/neural-hud and register the hooks in
 # ~/.claude/settings.json (a backup is written first). Safe to re-run: it
@@ -34,9 +34,16 @@ test:
 art:
 	python3 tools/gen_art.py
 
-# Render the HUD mid-task into assets/screenshot.png, offscreen.
+# Play a scripted ~45 s session on the HUD, live on your monitor: a plan, timed
+# steps, a permission hold and the outro. Runs the repo's hook.py and hud.py
+# (not the installed copies) in a private state dir; Claude Code isn't needed.
+demo:
+	NEURAL_HUD_MONITOR='$(MONITOR)' python3 tools/demo.py
+
+# Render the HUD mid-task, and on the standby screen, offscreen.
 screenshot:
 	python3 tools/screenshot.py 1920x1080 assets/screenshot.png
+	python3 tools/screenshot.py 1920x1080 assets/screenshot-standby.png --waiting
 
 # Close a running HUD until the next prompt (what the keyboard shortcut runs).
 close:

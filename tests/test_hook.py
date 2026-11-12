@@ -108,6 +108,136 @@ class Lifecycle(unittest.TestCase):
         self.assertEqual(len(events()[-1]["detail"]), 160)
 
 
+class Timing(unittest.TestCase):
+    def setUp(self):
+        Lifecycle.setUp(self)
+
+    def test_each_step_logs_an_end_with_the_same_id(self):
+        run_hook({"hook_event_name": "PreToolUse", "session_id": "t", "tool_name": "Bash",
+                  "tool_use_id": "toolu_1", "tool_input": {"description": "Run tests"}})
+        run_hook({"hook_event_name": "PostToolUse", "session_id": "t", "tool_name": "Bash",
+                  "tool_use_id": "toolu_1"})
+        start, end = events()[-2:]
+        self.assertEqual((start["kind"], start["id"], start["tool"]), ("EXEC", "toolu_1", "Bash"))
+        self.assertEqual((end["kind"], end["id"]), ("END", "toolu_1"))
+
+    def test_a_failed_step_also_ends(self):
+        run_hook({"hook_event_name": "PostToolUseFailure", "session_id": "t", "tool_name": "Bash",
+                  "tool_use_id": "toolu_2"})
+        self.assertEqual([e["kind"] for e in events()[-2:]], ["END", "FAULT"])
+
+
+class Waiting(unittest.TestCase):
+    def setUp(self):
+        Lifecycle.setUp(self)
+
+    def reason(self):
+        with open(os.path.join(hook.STATE_DIR, "w-t")) as f:
+            return json.load(f)
+
+    def test_permission_says_what_it_is_for(self):
+        run_hook({"hook_event_name": "PermissionRequest", "session_id": "t", "tool_name": "Bash",
+                  "tool_input": {"description": "Force-push", "command": "git push -f"}})
+        self.assertEqual(state(), "waiting")
+        self.assertEqual((self.reason()["kind"], self.reason()["detail"]), ("PERMISSION", "EXEC · Force-push"))
+
+    def test_the_generic_notification_does_not_replace_it(self):
+        run_hook({"hook_event_name": "PermissionRequest", "session_id": "t", "tool_name": "Bash",
+                  "tool_input": {"description": "Force-push"}})
+        run_hook({"hook_event_name": "Notification", "session_id": "t",
+                  "message": "Claude needs your permission to use Bash"})
+        self.assertEqual(self.reason()["detail"], "EXEC · Force-push")
+
+    def test_the_notification_is_used_when_nothing_better_exists(self):
+        run_hook({"hook_event_name": "Notification", "session_id": "t", "message": "Claude needs you"})
+        self.assertEqual(self.reason()["detail"], "Claude needs you")
+
+    def test_a_question_shows_its_text(self):
+        run_hook({"hook_event_name": "PreToolUse", "session_id": "t", "tool_name": "AskUserQuestion",
+                  "tool_input": {"questions": [{"question": "Which repo name?"}]}})
+        self.assertEqual(state(), "waiting")
+        self.assertEqual((self.reason()["kind"], self.reason()["detail"]), ("QUESTION", "Which repo name?"))
+
+
+class Plan(unittest.TestCase):
+    def setUp(self):
+        Lifecycle.setUp(self)
+
+    def plan(self):
+        with open(os.path.join(hook.STATE_DIR, "plan-t.json")) as f:
+            return [(i["id"], i["text"], i["status"]) for i in json.load(f)["items"]]
+
+    def post(self, tool, inp, resp=None):
+        run_hook({"hook_event_name": "PostToolUse", "session_id": "t", "tool_name": tool,
+                  "tool_input": inp, "tool_response": resp})
+
+    def test_todowrite_replaces_the_whole_list(self):
+        self.post("TodoWrite", {"todos": [{"content": "A", "activeForm": "Doing A", "status": "completed"},
+                                          {"content": "B", "activeForm": "Doing B", "status": "in_progress"}]})
+        self.assertEqual(self.plan(), [("1", "A", "completed"), ("2", "B", "in_progress")])
+        self.post("TodoWrite", {"todos": [{"content": "C", "status": "pending"}]})
+        self.assertEqual(self.plan(), [("1", "C", "pending")])
+
+    def test_todowrite_shows_the_current_step_in_the_stream(self):
+        kind, detail = hook.describe("TodoWrite", {"todos": [
+            {"content": "A", "status": "completed"}, {"content": "B", "activeForm": "Doing B", "status": "in_progress"}]}, "")
+        self.assertEqual((kind, detail), ("PLAN", "Doing B"))
+
+    def test_tasks_are_created_and_updated(self):
+        self.post("TaskCreate", {"subject": "Write it", "activeForm": "Writing it"}, "Task #1 created successfully")
+        self.post("TaskCreate", {"subject": "Test it"}, {"task": {"id": "2"}})
+        self.post("TaskCreate", {"subject": "Ship it"})  # no id in the response: next number
+        self.post("TaskUpdate", {"taskId": "1", "status": "completed"})
+        self.post("TaskUpdate", {"taskId": "2", "status": "in_progress", "subject": "Test it well"})
+        self.post("TaskUpdate", {"taskId": "3", "status": "deleted"})
+        self.assertEqual(self.plan(), [("1", "Write it", "completed"), ("2", "Test it well", "in_progress")])
+
+
+class HudTiming(unittest.TestCase):
+    """HUD.finish() and HUD.elapsed(): pairing ENDs with their steps and timing them."""
+
+    @classmethod
+    def setUpClass(cls):
+        try:
+            cls.HUD = importlib.import_module("hud").HUD
+        except ImportError as e:
+            raise unittest.SkipTest(f"PyQt6 not available: {e}")
+
+    def hud(self):
+        h = type("S", (), {})()
+        h.running, h.ended, h.waiting_since = [], {}, None
+        return h
+
+    def test_pairs_by_id_and_times_it(self):
+        h, ev = self.hud(), {"ts": 100.0, "id": "a", "tool": "Bash"}
+        h.running.append(ev)
+        self.assertAlmostEqual(self.HUD.elapsed(h, ev, 103.0), 3.0)
+        self.HUD.finish(h, {"ts": 104.5, "kind": "END", "id": "a", "tool": "Bash"})
+        self.assertEqual((h.running, ev["dur"]), ([], 4.5))
+
+    def test_an_end_arriving_first_is_kept_for_its_step(self):
+        h = self.hud()
+        self.HUD.finish(h, {"ts": 104.0, "kind": "END", "id": "b", "tool": "Read"})
+        self.assertEqual(h.ended, {"b": 104.0})
+
+    def test_without_ids_it_pairs_the_oldest_call_of_the_same_tool(self):
+        h = self.hud()
+        a, b = {"ts": 1.0, "tool": "Bash"}, {"ts": 2.0, "tool": "Bash"}
+        h.running += [a, b]
+        self.HUD.finish(h, {"ts": 5.0, "kind": "END", "tool": "Bash"})
+        self.assertEqual((a.get("dur"), h.running), (4.0, [b]))
+
+    def test_time_on_hold_is_not_counted(self):
+        h, ev = self.hud(), {"ts": 100.0, "id": "c", "tool": "Bash"}
+        h.running.append(ev)
+        h.waiting_since = 102.0
+        self.assertAlmostEqual(self.HUD.elapsed(h, ev, 110.0), 2.0)  # frozen while held
+        self.HUD.end_wait(type("W", (), {"running": h.running, "waiting_since": 102.0,
+                                          "reason": None, "accent": None})(), 110.0)
+        self.HUD.finish(h, {"ts": 111.0, "kind": "END", "id": "c"})
+        self.assertAlmostEqual(ev["dur"], 3.0)
+
+
 class Typing(unittest.TestCase):
     """HUD.typed() drives the status line's typewriter effect."""
 

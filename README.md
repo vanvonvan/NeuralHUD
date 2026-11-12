@@ -26,8 +26,13 @@
 </p>
 
 <p align="center">
-  <sub>Rendered offscreen by <code>tools/screenshot.py</code> from a scripted turn — the real
-  drawing code, caught mid-keystroke on the status line.</sub>
+  <img src="assets/screenshot-standby.png" alt="Neural HUD on hold, awaiting a permission" width="100%">
+</p>
+
+<p align="center">
+  <sub>Rendered offscreen by <code>tools/screenshot.py</code> from a scripted turn with the real
+  drawing code: mid-task, and on hold while Claude waits for a permission.
+  <code>make demo</code> plays the same kind of turn live on your monitor.</sub>
 </p>
 
 ## Features
@@ -36,13 +41,18 @@
   colour-coded by what Claude is doing: cyan for reading files, magenta for editing, amber for
   running commands, green for searching, violet for subagents, yellow for MCP tools.
 - ⌨️ **A live status line** under the core that types out Claude's current step key by key, with
-  a blinking block cursor, as if someone were at the terminal.
-- 📜 **Activity stream**: a log of Claude's actual steps, appearing as they happen.
-- 📈 **Telemetry**: elapsed time, operation count, a breakdown by kind of action and an
-  activity trace for the last 60 seconds.
+  a blinking block cursor, as if someone were at the terminal, and a live timer once a step
+  runs longer than a second.
+- ✅ **Mission plan**: when Claude makes a to-do plan, it appears as a checklist above the
+  activity stream, ticking steps off as they finish, with the current one highlighted.
+- 📜 **Activity stream**: a log of Claude's actual steps as they happen, with how long each took.
+- 📈 **Telemetry**: elapsed time, operation count, a breakdown by kind of action, the longest
+  steps of the turn and an activity trace for the last 60 seconds.
+- ⏸️ **Stays up when Claude is blocked on you**: an amber "AWAITING OPERATOR" screen says what
+  it's waiting for (the command needing approval, or the question it asked) and for how long.
+  Time on hold isn't counted in step timings.
 - 🔌 **Opens and closes itself**: "LINK ESTABLISHED" when work starts, "TASK COMPLETE" with a
-  CRT power-off when Claude finishes, "AWAITING OPERATOR" when Claude needs your approval or
-  an answer. It comes back once you've approved.
+  CRT power-off when Claude finishes.
 - 🫥 **Never gets in the way**: the window takes no keyboard focus and lets every click through, so
   your other screens work normally. An optional keyboard shortcut closes it until your next prompt.
 - 🪶 **Light**: runs on the GPU, about 10% of one CPU core at 3072×1728.
@@ -92,9 +102,10 @@ shortcut added by the installer stays: remove it in **Settings → Keyboard → 
 
 | Event | Effect |
 |---|---|
-| `UserPromptSubmit`, `PostToolUse`, `PostToolUseFailure` | session is *working*; start the HUD if needed |
+| `UserPromptSubmit` | session is *working*; start the HUD if needed |
 | `PreToolUse` | log the step to the activity stream |
-| `PermissionRequest`, `Notification` (permission prompt), `AskUserQuestion` | session is *waiting* |
+| `PostToolUse`, `PostToolUseFailure` | session is *working*; log that the step ended, to time it; update the plan after `TodoWrite` / `TaskCreate` / `TaskUpdate` |
+| `PermissionRequest`, `Notification` (permission prompt), `AskUserQuestion` | session is *waiting*; record why, for the standby screen |
 | `Stop`, `StopFailure`, `SessionEnd` | session is *done* |
 
 `hud.py` shows while any session is working and plays its outro when none is. Several Claude
@@ -108,8 +119,9 @@ are shown relative to the project.
 ## Development
 
 ```sh
-make test         # headless: hook events, state ordering, status-line typing
-make screenshot   # re-render assets/screenshot.png offscreen
+make demo         # play a scripted ~45 s session live on your monitor (MONITOR= works here too)
+make test         # headless: hook events, timing, plan, standby reasons, status-line typing
+make screenshot   # re-render the two screenshots offscreen
 make art          # regenerate the icon, logo, banner and social preview (needs pycairo)
 ```
 
@@ -125,7 +137,7 @@ Makefile           install, uninstall and the development tasks
 install.sh         copies both to ~/.claude/neural-hud and registers the hooks
 uninstall.sh       undoes install.sh
 tests/             headless unit tests
-tools/             art and screenshot generators
+tools/             demo, screenshot and art generators
 assets/            README and repository art
 ```
 

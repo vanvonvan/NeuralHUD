@@ -1,7 +1,8 @@
 # Made by Claude
 """Claude Code hook for the neural HUD. Records whether this session is working
-or waiting for the user, logs tool calls for the activity stream, and starts the
-HUD daemon when work begins. Never fails the hook."""
+or waiting for the user (and why), logs tool calls and when they finish for the
+activity stream, keeps the session's plan for the checklist panel, and starts
+the HUD daemon when work begins. Never fails the hook."""
 import fcntl
 import json
 import os
@@ -42,15 +43,111 @@ def describe(tool, inp, cwd):
         return "NET", str(inp.get("query", ""))
     if tool == "Skill":
         return "SKILL", str(inp.get("skill", ""))
+    if tool == "TodoWrite":
+        todos = [t for t in inp.get("todos") or [] if isinstance(t, dict)]
+        now_doing = next((t for t in todos if t.get("status") == "in_progress"), None)
+        done = sum(1 for t in todos if t.get("status") == "completed")
+        if now_doing:
+            return "PLAN", now_doing.get("activeForm") or now_doing.get("content") or "plan updated"
+        return "PLAN", f"{done}/{len(todos)} steps done"
+    if tool in PLAN_TOOLS:
+        if inp.get("status") == "completed":
+            return "PLAN", f"step {inp.get('taskId', '')} done"
+        return "PLAN", inp.get("activeForm") or inp.get("subject") or f"step {inp.get('taskId', '')} updated"
+    if tool == "AskUserQuestion":
+        qs = inp.get("questions") or [{}]
+        return "QUESTION", (qs[0] or {}).get("question") or "question for you"
     if tool.startswith("mcp__"):
         return "MCP", " › ".join(tool.split("__")[1:])
     return "TOOL", tool
 
 
-def emit(kind, detail):
-    detail = " ".join(str(detail).split())[:160]
+PLAN_TOOLS = ("TodoWrite", "TaskCreate", "TaskUpdate")
+
+
+def clean(text, n=160):
+    return " ".join(str(text).split())[:n]
+
+
+def emit(kind, detail, **extra):
+    """Append one line to the activity log. `id` and `tool` pair a step with its END."""
+    ev = {"ts": TS, "kind": kind, "detail": clean(detail)}
+    ev.update({k: v for k, v in extra.items() if v})
     with open(EVENTS, "a") as f:
-        f.write(json.dumps({"ts": TS, "kind": kind, "detail": detail}) + "\n")
+        f.write(json.dumps(ev) + "\n")
+
+
+def locked_json(path, update):
+    """Read-modify-write a small JSON file under an exclusive lock: hooks run in parallel."""
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+    with os.fdopen(fd, "r+") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        try:
+            data = json.loads(f.read() or "{}")
+        except ValueError:
+            data = {}
+        new = update(data)
+        if new is not None:
+            f.seek(0)
+            f.truncate()
+            json.dump(new, f)
+
+
+def set_reason(path, kind, detail, weak=False):
+    """Why the session is waiting, for the HUD's standby screen. A weak reason (the generic
+    notification text) never replaces a specific one written moments before."""
+    def update(old):
+        if old.get("ts", 0) > TS or (weak and TS - old.get("ts", 0) < 30):
+            return None
+        return {"ts": TS, "kind": kind, "detail": clean(detail, 200)}
+    locked_json(path, update)
+
+
+def task_id(resp):
+    """The id TaskCreate assigned, wherever the tool response puts it."""
+    if isinstance(resp, dict):
+        for k in ("taskId", "id"):
+            if isinstance(resp.get(k), (str, int)):
+                return str(resp[k])
+        for v in resp.values():
+            found = task_id(v)
+            if found:
+                return found
+        return None
+    m = re.search(r"#(\d+)", str(resp or ""))
+    return m.group(1) if m else None
+
+
+def update_plan(path, tool, inp, resp):
+    """Keep the session's plan: {"ts", "items": [{"id", "text", "active", "status"}]}."""
+    def update(plan):
+        items = plan.get("items", [])
+        if tool == "TodoWrite":
+            if plan.get("ts", 0) > TS:
+                return None  # a later full list already landed
+            items = [{"id": str(i + 1), "text": clean(t.get("content", ""), 120),
+                      "active": clean(t.get("activeForm", ""), 120), "status": t.get("status", "pending")}
+                     for i, t in enumerate(inp.get("todos") or []) if isinstance(t, dict)]
+        elif tool == "TaskCreate":
+            tid = task_id(resp) or str(1 + max([int(i["id"]) for i in items if str(i["id"]).isdigit()] or [0]))
+            items = [i for i in items if i["id"] != tid] + [{
+                "id": tid, "text": clean(inp.get("subject", ""), 120),
+                "active": clean(inp.get("activeForm", ""), 120), "status": "pending"}]
+        elif tool == "TaskUpdate":
+            tid = str(inp.get("taskId", ""))
+            if inp.get("status") == "deleted":
+                items = [i for i in items if i["id"] != tid]
+            else:
+                item = next((i for i in items if i["id"] == tid), None)
+                if item is None and inp.get("subject"):
+                    item = {"id": tid, "text": "", "active": "", "status": "pending"}
+                    items.append(item)
+                if item is not None:
+                    for src, dst in (("status", "status"), ("subject", "text"), ("activeForm", "active")):
+                        if inp.get(src):
+                            item[dst] = clean(inp[src], 120)
+        return {"ts": max(TS, plan.get("ts", 0)), "items": items}
+    locked_json(path, update)
 
 
 def set_state(path, state):
@@ -85,6 +182,9 @@ def main():
     sid = "".join(ch for ch in str(data.get("session_id", "default")) if ch.isalnum() or ch == "-")
     os.makedirs(STATE_DIR, exist_ok=True)
     path = os.path.join(STATE_DIR, "s-" + sid)
+    reason = os.path.join(STATE_DIR, "w-" + sid)
+    inp = data.get("tool_input") or {}
+    tid = data.get("tool_use_id")
 
     if event in ("Stop", "SessionEnd", "StopFailure"):
         set_state(path, "done")
@@ -92,12 +192,20 @@ def main():
             emit("DONE", "task complete")
         return
     if event == "PreToolUse":
+        kind, detail = describe(tool, inp, cwd)
         if tool == "AskUserQuestion":
+            set_reason(reason, "QUESTION", detail)
             set_state(path, "waiting")
         else:
-            emit(*describe(tool, data.get("tool_input") or {}, cwd))
+            emit(kind, detail, id=tid, tool=tool)
         return  # no state change: a permission prompt may follow
-    if event in ("PermissionRequest", "Notification"):
+    if event == "PermissionRequest":
+        kind, detail = describe(tool, inp, cwd)
+        set_reason(reason, "PERMISSION", f"{kind} · {detail}")
+        set_state(path, "waiting")
+        return
+    if event == "Notification":
+        set_reason(reason, "PERMISSION", data.get("message") or "Claude needs your permission", weak=True)
         set_state(path, "waiting")
         return
 
@@ -111,8 +219,13 @@ def main():
         except OSError:
             pass
         emit("LINK", "directive received")
-    elif event == "PostToolUseFailure":
-        emit("FAULT", f"{tool} failed")
+    else:  # the step finished: lets the HUD time it
+        if tool != "AskUserQuestion":
+            emit("END", tool, id=tid, tool=tool)
+        if event == "PostToolUseFailure":
+            emit("FAULT", f"{tool} failed")
+        elif tool in PLAN_TOOLS:
+            update_plan(os.path.join(STATE_DIR, f"plan-{sid}.json"), tool, inp, data.get("tool_response"))
     set_state(path, "working")
 
     try:  # closed with the shortcut during this turn: stay closed until the next prompt
