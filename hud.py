@@ -48,13 +48,8 @@ GREEN = QColor("#7dffb0")
 AMBER = QColor("#ffb347")
 
 
-def find_monitor():
-    """Return (x, y, w, h) of the monitor to draw on, or None.
-
-    NEURAL_HUD_MONITOR picks it: an xrandr output name (e.g. HDMI-1) or text found
-    in the monitor's EDID (e.g. its brand). Unset: the smallest non-primary monitor.
-    """
-    want = os.environ.get("NEURAL_HUD_MONITOR", "").strip()
+def xrandr_monitors():
+    """Connected monitors: [{"name", "primary", "geo": (x, y, w, h)}]."""
     out = subprocess.run(["xrandr"], capture_output=True, text=True).stdout
     mons = []
     for line in out.splitlines():
@@ -62,25 +57,97 @@ def find_monitor():
         if m:
             w, h, x, y = map(int, m.groups()[2:])
             mons.append({"name": m.group(1), "primary": bool(m.group(2)), "geo": (x, y, w, h)})
-    if not want:
-        side = [m for m in mons if not m["primary"]]
-        return min(side, key=lambda m: m["geo"][2] * m["geo"][3])["geo"] if side else None
-    for m in mons:
-        if m["name"] == want:
-            return m["geo"]
-    # match the EDID text, then map the DRM connector (HDMI-A-1) to the xrandr name (HDMI-1)
+    return mons
+
+
+def edids(mons):
+    """{xrandr name: raw EDID bytes}, mapping each DRM connector (HDMI-A-1) to its
+    xrandr output (HDMI-1)."""
+    found = {}
     for name in os.listdir("/sys/class/drm"):
         try:
             with open(f"/sys/class/drm/{name}/edid", "rb") as f:
-                if want.upper().encode() not in f.read().upper():
-                    continue
+                data = f.read()
         except OSError:
             continue
-        kind, num = re.match(r"([A-Za-z]+).*?(\d+)$", name.split("-", 1)[1]).groups()
-        for m in mons:
-            if re.fullmatch(rf"{kind}\S*?-{num}", m["name"]):
-                return m["geo"]
+        m = re.match(r"([A-Za-z]+).*?(\d+)$", name.split("-", 1)[-1])
+        if not data or not m:
+            continue
+        kind, num = m.groups()
+        for mon in mons:
+            if re.fullmatch(rf"{kind}\S*?-{num}", mon["name"]):
+                found[mon["name"]] = data
+    return found
+
+
+def edid_label(data):
+    """The model name an EDID advertises (e.g. "ARZOPA"), else its 3-letter maker code."""
+    for o in (54, 72, 90, 108):
+        if data[o:o + 3] == b"\0\0\0" and data[o + 3:o + 4] == b"\xfc":
+            name = data[o + 5:o + 18].split(b"\n")[0].decode("ascii", "replace").strip()
+            if name:
+                return name
+    if len(data) > 9:
+        m = (data[8] << 8) | data[9]
+        return "".join(chr(64 + ((m >> s) & 31)) for s in (10, 5, 0))
+    return ""
+
+
+def pick_monitor(mons, want):
+    """The monitor NEURAL_HUD_MONITOR=want selects, or None."""
+    if not want:
+        side = [m for m in mons if not m["primary"]]
+        return min(side, key=lambda m: m["geo"][2] * m["geo"][3]) if side else None
+    for m in mons:
+        if m["name"] == want:
+            return m
+    for name, data in edids(mons).items():  # else: text found in the monitor's EDID
+        if want.upper().encode() in data.upper():
+            return next(m for m in mons if m["name"] == name)
     return None
+
+
+def find_monitor():
+    """Return (x, y, w, h) of the monitor to draw on, or None.
+
+    NEURAL_HUD_MONITOR picks it: an xrandr output name (e.g. HDMI-1) or text found
+    in the monitor's EDID (e.g. its brand). Unset: the smallest non-primary monitor.
+    """
+    m = pick_monitor(xrandr_monitors(), os.environ.get("NEURAL_HUD_MONITOR", "").strip())
+    return m["geo"] if m else None
+
+
+def list_monitors(want=""):
+    """Print the connected monitors and the MONITOR= values that select each one."""
+    mons = xrandr_monitors()
+    if not mons:
+        print("no monitors found (is xrandr working? on Wayland it needs XWayland)")
+        return
+    labels = {n: edid_label(d) for n, d in edids(mons).items()}
+    # only offer a model name that really selects its monitor (and no other one first)
+    labels = {n: l for n, l in labels.items() if l and (pick_monitor(mons, l) or {}).get("name") == n}
+    default = pick_monitor(mons, "")
+    chosen = pick_monitor(mons, want) if want else None
+    rows = []
+    for m in mons:
+        x, y, w, h = m["geo"]
+        notes = (["primary"] if m["primary"] else []) + (["default"] if m is default else [])
+        if m is chosen:
+            notes.append(f"MONITOR={want}")
+        label = labels.get(m["name"], "")
+        rows.append((m["name"], label or "-", f"{w}x{h}+{x}+{y}", ", ".join(notes)))
+    widths = [max(len(r[i]) for r in rows + [("OUTPUT", "MODEL", "GEOMETRY", "")]) for i in range(3)]
+    print(f"{'OUTPUT':<{widths[0]}}  {'MODEL':<{widths[1]}}  GEOMETRY")
+    for r in rows:
+        print(f"{r[0]:<{widths[0]}}  {r[1]:<{widths[1]}}  {r[2]:<{widths[2]}}  {r[3]}".rstrip())
+    print()
+    print("Use the OUTPUT or the MODEL, e.g.:  make install MONITOR=" + (
+        next((labels[m["name"]] for m in mons if not m["primary"] and " " not in labels.get(m["name"], " ")), "")
+        or mons[-1]["name"]))
+    print("Without MONITOR, the HUD goes to the one marked default"
+          + (" (none: every monitor is primary)." if not default else "."))
+    if want and not chosen:
+        print(f"MONITOR={want} matches no connected monitor: the HUD would not open.")
 
 
 def read_states():
@@ -694,6 +761,9 @@ def main():
     os.makedirs(STATE_DIR, exist_ok=True)
     if "--close" in sys.argv:  # bound to the keyboard shortcut
         open(DISMISSED, "w").close()
+        return
+    if "--list-monitors" in sys.argv:  # `make monitors`
+        list_monitors(os.environ.get("NEURAL_HUD_MONITOR", "").strip())
         return
     lock = open(LOCK, "w")
     try:

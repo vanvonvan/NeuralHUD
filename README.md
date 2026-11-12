@@ -60,13 +60,15 @@
 git clone git@github.com:vanvonvan/NeuralHUD.git
 cd NeuralHUD
 
-./install.sh                                   # uses your smallest non-primary monitor
-./install.sh --monitor HDMI-1                  # or pick one by xrandr output name
-./install.sh --monitor ARZOPA                  # or by text in its EDID (usually the brand)
-./install.sh --shortcut '<Super><Alt>n'        # GNOME: add a close shortcut
+make monitors                                  # list your screens and their MONITOR= values
+make install                                   # uses your smallest non-primary monitor
+make install MONITOR=HDMI-1                    # or pick one by xrandr output name
+make install MONITOR=ARZOPA                    # or by text in its EDID (usually the brand)
+make install SHORTCUT='<Super><Alt>n'          # GNOME: add a close shortcut
 ```
 
-The installer copies `hud.py` and `hook.py` to `~/.claude/neural-hud/` and adds hooks to
+`MONITOR` and `SHORTCUT` can be combined. `make install` runs `install.sh`, which
+copies `hud.py` and `hook.py` to `~/.claude/neural-hud/` and adds hooks to
 `~/.claude/settings.json`, after writing a backup to `settings.json.bak-neural-hud`. Your
 existing settings and hooks are kept. Running it again replaces the previous install, so
 after a `git pull` just run it again.
@@ -77,7 +79,7 @@ shortcut runs). It stays closed until your next prompt.
 ## Uninstall
 
 ```sh
-./uninstall.sh
+make uninstall
 ```
 
 This removes the hooks (backing up `settings.json` first) and `~/.claude/neural-hud/`. A GNOME
@@ -119,6 +121,7 @@ HUD or a Claude Code session running on the same machine.
 ```
 hud.py             the display: a frameless, click-through OpenGL window
 hook.py            the Claude Code hook that feeds it
+Makefile           install, uninstall and the development tasks
 install.sh         copies both to ~/.claude/neural-hud and registers the hooks
 uninstall.sh       undoes install.sh
 tests/             headless unit tests
