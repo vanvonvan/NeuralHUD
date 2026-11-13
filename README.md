@@ -26,14 +26,17 @@
 </p>
 
 <p align="center">
-  <img src="assets/screenshot-standby.png" alt="Neural HUD on hold, awaiting a permission" width="49%">
-  <img src="assets/screenshot-summary.png" alt="Neural HUD's end-of-task summary" width="49%">
+  <img src="assets/screenshot-standby.png" alt="Neural HUD's standby banner, awaiting a permission" width="100%">
+</p>
+
+<p align="center">
+  <img src="assets/screenshot-summary.png" alt="Neural HUD's end-of-task summary" width="100%">
 </p>
 
 <p align="center">
   <sub>Rendered offscreen by <code>tools/screenshot.py</code> from a scripted pair of sessions with the
-  real drawing code: mid-task, on hold while Claude waits for a permission, and the end-of-task
-  summary. <code>make demo</code> plays the same kind of turn live on your monitor.</sub>
+  real drawing code: mid-task, the standby banner while Claude waits for a permission, and the
+  end-of-task summary. <code>make demo</code> plays the same kind of turn live on your monitor.</sub>
 </p>
 
 ### Themes
@@ -76,8 +79,11 @@
 - 🏁 **End-of-task summary**: before the power-off, a report card counts up the time taken,
   steps, files, lines changed, plan progress and failures, and names the longest step.
 - 🎨 **Five colour themes**: cyan, amber, phosphor, red and violet.
-- ⏸️ **Stays up when Claude is blocked on you**: an amber "AWAITING OPERATOR" screen says what
-  it's waiting for (the command needing approval, or the question it asked) and for how long.
+- ⏸️ **Steps aside when Claude is blocked on you**: the HUD shrinks to an amber "AWAITING OPERATOR"
+  banner along the top of its monitor that says what it's waiting for (the command needing
+  approval, or the question it asked) and for how long. The rest of that monitor is uncovered,
+  so a terminal there stays readable while you answer. Once Claude resumes, the HUD fills the
+  monitor again. `STANDBY=full` keeps the old full-screen standby.
   Time on hold isn't counted in step timings.
 - 🔌 **Opens and closes itself**: "LINK ESTABLISHED" when work starts, the summary and a CRT
   power-off when Claude finishes.
@@ -104,6 +110,7 @@ make install MONITOR=HDMI-1                    # or pick one by xrandr output na
 make install MONITOR=ARZOPA                    # or by text in its EDID (usually the brand)
 make install THEME=amber                       # cyan (default), amber, phosphor, red, violet
 make install CONTEXT=1m                        # the context window the gauge measures against
+make install STANDBY=full                      # stand by on the whole monitor, not a top banner
 make install SHORTCUT='<Super><Alt>n'          # GNOME: add a close shortcut
 ```
 
@@ -148,7 +155,7 @@ shortcut added by the installer stays: remove it in **Settings → Keyboard → 
 | `UserPromptSubmit` | session is *working*; record its project, transcript and turn start; start the HUD if needed |
 | `PreToolUse` | log the step to the activity stream |
 | `PostToolUse`, `PostToolUseFailure` | session is *working*; log that the step ended, to time it, with the lines an edit added and removed; update the plan after `TodoWrite` / `TaskCreate` / `TaskUpdate` |
-| `PermissionRequest`, `Notification` (permission prompt), `AskUserQuestion` | session is *waiting*; record why, for the standby screen |
+| `PermissionRequest`, `Notification` (permission prompt), `AskUserQuestion` | session is *waiting*; record why, for the standby banner |
 | `Stop`, `StopFailure`, `SessionEnd` | session is *done* |
 
 `hud.py` shows while any session is working and plays its outro when none is. Several Claude

@@ -291,6 +291,26 @@ class HudTiming(unittest.TestCase):
         self.assertAlmostEqual(ev["dur"], 3.0)
 
 
+    def test_waiting_shrinks_to_the_banner_and_resuming_fills_the_monitor(self):
+        hud = importlib.import_module("hud")
+        h = type("S", (), {})()
+        h.geo, h.u, h.banner, h.closing, h.waiting_since, h.geos = (10, 20, 3072, 1728), 1.0, False, None, None, []
+        h.setGeometry = lambda *g: h.geos.append(g)
+        h.banner_h = types.MethodType(self.HUD.banner_h, h)
+        fit = types.MethodType(self.HUD.fit_window, h)
+        fit()
+        self.assertEqual(h.geos, [])                      # working: stays full, no needless resize
+        h.waiting_since = 100.0
+        fit()
+        fit()
+        self.assertEqual(h.geos, [(10, 20, 3072, hud.BANNER_H)])  # once, along the top
+        h.waiting_since = None                            # answered: work resumes
+        fit()
+        self.assertEqual(h.geos[-1], (10, 20, 3072, 1728))
+        h.waiting_since, h.closing = 100.0, 105.0         # the outro always gets the whole monitor
+        fit()
+        self.assertEqual((h.banner, len(h.geos)), (False, 2))
+
     def test_line_counts_reach_the_step_and_the_summary(self):
         h = self.hud()
         a = {"ts": 1.0, "id": "e1", "tool": "Edit", "kind": "WRITE", "detail": "a.py"}

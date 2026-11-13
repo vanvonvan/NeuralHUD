@@ -3,9 +3,10 @@
 
 Opens when a session starts working and closes with a "TASK COMPLETE" outro when
 no session is working any more. While Claude waits for an approval or an answer
-it stays up on an amber "AWAITING OPERATOR" standby screen that says why. The
-window never takes focus and lets every click through, so the other displays
-keep working normally.
+it shrinks to an amber "AWAITING OPERATOR" banner along the top of its monitor that
+says why, so a terminal on that monitor can be seen and answered, and fills the
+monitor again once work resumes. The window never takes focus and lets every click
+through, so the other displays keep working normally.
 
 Fed by hook.py through files in $XDG_RUNTIME_DIR/claude-neural/:
   s-<session>          "working|waiting|done <ts>"
@@ -17,8 +18,9 @@ Fed by hook.py through files in $XDG_RUNTIME_DIR/claude-neural/:
   turn-<session>       timestamp of that session's last prompt
   m-<session>.json     {"cwd", "transcript"}: project dir (header) and transcript (context gauge)
 
-NEURAL_HUD_THEME picks the palette (cyan, amber, phosphor, red, violet), and
-NEURAL_HUD_CONTEXT_WINDOW the context size the gauge measures against.
+NEURAL_HUD_THEME picks the palette (cyan, amber, phosphor, red, violet),
+NEURAL_HUD_CONTEXT_WINDOW the context size the gauge measures against, and
+NEURAL_HUD_STANDBY=full keeps the whole monitor covered while waiting instead of the banner.
 """
 import fcntl
 import json
@@ -85,6 +87,10 @@ SUMMARY_FOR = 4.2   # seconds the end-of-task summary shows before the CRT power
 CRT_FOR = 0.85
 GREEN = QColor("#7dffb0")
 AMBER = QColor("#ffb347")
+# While Claude waits on you: "banner" (default) shrinks the window to a strip at the top of the
+# monitor, so whatever is under it (often the terminal holding the question) stays visible.
+STANDBY = "full" if os.environ.get("NEURAL_HUD_STANDBY", "").strip().lower() == "full" else "banner"
+BANNER_H = 190      # banner height, in HUD units (1728 to the monitor's height)
 
 
 def xrandr_monitors():
@@ -367,7 +373,9 @@ class HUD(QOpenGLWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
         self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent)
         x, y, w, h = geo
+        self.geo = geo
         self.W, self.H = w, h
+        self.banner = False    # shrunk to the standby banner
         self.setGeometry(x, y, w, h)
         self.u = h / 1728
         self.cx, self.cy = w * 0.5, h * 0.50
@@ -682,6 +690,7 @@ class HUD(QOpenGLWidget):
                     self.fire(i, self.close_color, fanout=1)
                 self.shocks.append((now, self.close_color))
 
+        self.fit_window()
         self.read_new_events()
         self.poll_context(now)
         self.simulate(now, dt)
@@ -707,6 +716,18 @@ class HUD(QOpenGLWidget):
         self.waiting_since = None
         self.reason = None
         self.accent = QColor(CYAN)
+
+    def banner_h(self):
+        return max(110, int(BANNER_H * self.u))
+
+    def fit_window(self):
+        """Shrink to the banner while waiting on you, and fill the monitor again otherwise
+        (work resumed, or the outro is playing)."""
+        want = STANDBY == "banner" and self.waiting_since is not None and not self.closing
+        if want != self.banner:
+            self.banner = want
+            x, y, w, h = self.geo
+            self.setGeometry(x, y, w, self.banner_h() if want else h)
 
     def simulate(self, now, dt):
         waiting = self.waiting_since is not None
@@ -750,6 +771,10 @@ class HUD(QOpenGLWidget):
         now = time.time()
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        if self.banner:
+            self.draw_banner(p, now)
+            p.end()
+            return
         if self.closing and now - self.closing > self.crt_at:
             self.draw_crt_off(p, (now - self.closing - self.crt_at) / CRT_FOR)
             p.end()
@@ -1349,6 +1374,82 @@ class HUD(QOpenGLWidget):
         p.setFont(self.font(20))
         p.setPen(with_alpha(AMBER, 150))
         p.drawText(QPointF(self.cx - QFontMetrics(self.font(20)).horizontalAdvance(hold) / 2, y + 130 * u), hold)
+
+    def draw_banner(self, p, now):
+        """The standby screen as a strip along the top of the monitor: what Claude is waiting
+        for and for how long, leaving the rest of the monitor uncovered."""
+        u, W, H = self.u, self.W, self.banner_h()
+        t = now - self.waiting_since
+        a = 255 * (int(t * 20) % 2) if t < 0.3 else 165 + 90 * (0.5 + 0.5 * math.sin(t * 2.6))
+        p.fillRect(QRectF(0, 0, W, H), QColor(8, 5, 0))
+        g = QRadialGradient(W * 0.5, 0, W * 0.5)
+        g.setColorAt(0, with_alpha(AMBER, 26 + 14 * math.sin(t * 2.6)))
+        g.setColorAt(1, QColor(0, 0, 0, 0))
+        p.fillRect(QRectF(0, 0, W, H), QBrush(g))
+        p.setPen(QPen(QColor(0, 0, 0, 70), 1))
+        p.drawLines([QLineF(0, yy, W, yy) for yy in range(0, H, 3)])
+        sweep = (t * 0.35) % 1.4 - 0.2  # a slow light passing along the strip
+        sg = QRadialGradient(W * sweep, H, W * 0.18)
+        sg.setColorAt(0, with_alpha(AMBER, 40))
+        sg.setColorAt(1, QColor(0, 0, 0, 0))
+        p.fillRect(QRectF(0, 0, W, H), QBrush(sg))
+        p.setPen(QPen(with_alpha(AMBER, 200), max(2, 3 * u)))
+        p.drawLine(QLineF(0, H - 1.5 * u, W, H - 1.5 * u))
+        L = 34 * u
+        p.setPen(QPen(with_alpha(AMBER, 150), max(1, 2.5 * u)))
+        for (x, y, dx, dy) in ((24 * u, 22 * u, 1, 1), (W - 24 * u, 22 * u, -1, 1),
+                               (24 * u, H - 22 * u, 1, -1), (W - 24 * u, H - 22 * u, -1, -1)):
+            p.drawLine(QLineF(x, y, x + dx * L, y))
+            p.drawLine(QLineF(x, y, x, y + dy * L))
+
+        # left: a beacon, the title, and the reason typed out under it
+        x0 = 80 * u
+        cy = H * 0.5
+        r = 20 * u
+        pulse = 0.5 + 0.5 * math.sin(t * 2.6)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(with_alpha(AMBER, 60 + 60 * pulse))
+        p.drawEllipse(QPointF(x0 + r, cy), r * (1.5 + 0.4 * pulse), r * (1.5 + 0.4 * pulse))
+        p.setBrush(with_alpha(AMBER, a))
+        p.drawEllipse(QPointF(x0 + r, cy), r * 0.8, r * 0.8)
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        tx = x0 + r * 2 + 50 * u
+
+        right = [f"ON HOLD {fmt_dur(t, True)}", "RESPOND IN CLAUDE CODE"]
+        rf, rf2 = self.font(40, True), self.font(20)
+        rx = W - 80 * u - max(QFontMetrics(rf).horizontalAdvance(right[0]), QFontMetrics(rf2).horizontalAdvance(right[1]))
+
+        f = self.font(56, True)
+        f.setLetterSpacing(QFont.SpacingType.PercentageSpacing, 125)
+        p.setFont(f)
+        p.setPen(with_alpha(AMBER, a))
+        p.drawText(QPointF(tx, cy - 8 * u), "AWAITING OPERATOR")
+
+        kind, detail = self.reason or ("PERMISSION", "Claude needs your input")
+        df = self.font(28)
+        dm = QFontMetrics(df)
+        prompt = f"{kind} › "
+        room = int(rx - tx - 60 * u - dm.horizontalAdvance(prompt + "█"))
+        detail = dm.elidedText(detail, Qt.TextElideMode.ElideRight, max(0, room))
+        shown, typing = self.typed({"ts": self.waiting_since, "kind": kind}, detail, now, slot="reason")
+        y2 = cy + 8 * u + dm.ascent()
+        p.setFont(df)
+        p.setPen(AMBER)
+        p.drawText(QPointF(tx, y2), prompt)
+        p.setPen(QColor("#fff3e0"))
+        p.drawText(QPointF(tx + dm.horizontalAdvance(prompt), y2), shown)
+        if typing or int(now * 2.2) % 2:
+            ccx = tx + dm.horizontalAdvance(prompt + shown)
+            p.fillRect(QRectF(ccx + 2 * u, y2 - dm.ascent() * 0.8, dm.horizontalAdvance("█") * 0.55,
+                              dm.ascent() * 0.95), with_alpha(AMBER, 230))
+
+        # right: how long it has been waiting
+        p.setFont(rf)
+        p.setPen(with_alpha(AMBER, 235))
+        p.drawText(QPointF(W - 80 * u - QFontMetrics(rf).horizontalAdvance(right[0]), cy - 8 * u), right[0])
+        p.setFont(rf2)
+        p.setPen(with_alpha(AMBER, 150))
+        p.drawText(QPointF(W - 80 * u - QFontMetrics(rf2).horizontalAdvance(right[1]), y2), right[1])
 
     def draw_boot_text(self, p, t):
         a = 255 * (1 - ease((t - 0.9) / 0.7)) if t > 0.9 else 255 * ((int(t * 14) % 2) or t > 0.4)
