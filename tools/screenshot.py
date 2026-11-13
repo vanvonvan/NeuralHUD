@@ -8,7 +8,8 @@ context is needed: hud.py's QPainter is pointed at a QImage instead.
 
 Run: python3 tools/screenshot.py [WIDTHxHEIGHT] [OUT.png] [--waiting | --summary | --fault] [--half]
 
---waiting  the standby screen (Claude blocked on a permission prompt)
+--waiting  the standby screen (Claude blocked on a permission prompt): the banner strip,
+           or the whole screen with NEURAL_HUD_STANDBY=full
 --summary  the end-of-task summary
 --fault    the glitch a failed step causes
 --half     save at half size (rendered full size, then scaled smoothly, so text
@@ -136,11 +137,12 @@ def main():
     if WAITING:
         w.reason = hud.read_reason(states)
         w.begin_wait(now - 17)
+        w.fit_window()
     for _ in range(int(4 * hud.FPS)):  # let signals spread through the net
         w.simulate(time.time(), 1 / hud.FPS)
     w.typers = {}
 
-    img = QImage(W, H, QImage.Format.Format_RGB32)
+    img = QImage(W, w.banner_h() if w.banner else H, QImage.Format.Format_RGB32)
 
     class ImagePainter(QPainter):  # paintEvent does QPainter(self): draw into img instead
         def __init__(self, target):
@@ -168,10 +170,10 @@ def main():
     w.paintEvent(None)
     hud.time.time = real_time
     if "--half" in sys.argv:
-        img = img.scaled(W // 2, H // 2, Qt.AspectRatioMode.IgnoreAspectRatio, Qt.TransformationMode.SmoothTransformation)
+        img = img.scaled(W // 2, img.height() // 2, Qt.AspectRatioMode.IgnoreAspectRatio, Qt.TransformationMode.SmoothTransformation)
     if not img.save(out):
         sys.exit(f"could not write {out}")
-    print(f"wrote {out} ({W}x{H}, {MODE}, theme {hud.THEME})")
+    print(f"wrote {out} ({W}x{img.height()}, {MODE}, theme {hud.THEME})")
 
 
 if __name__ == "__main__":

@@ -109,7 +109,7 @@ def main():
     s.step("Edit", {"file_path": f"{ROOT}/hud.py", "old_string": "x = 1\ny = 2", "new_string": "x = 1\ny = 3"}, 0.3)
     s.step("Bash", {"description": "Run the full test suite", "command": "make test"}, 6.0)
 
-    # a permission prompt: the HUD holds on the amber standby screen
+    # a permission prompt: the HUD shrinks to the amber standby banner, then fills the monitor again
     s.plan(3)
     side.join()
     inp = {"description": "Push the release tag to GitHub", "command": "git push --tags"}

@@ -3,25 +3,30 @@
 # Installs Neural HUD for Claude Code: copies the scripts to ~/.claude/neural-hud
 # and adds the hooks to ~/.claude/settings.json (a backup is written first).
 #
-#   ./install.sh [--monitor NAME] [--theme NAME] [--context SIZE] [--shortcut '<Super><Alt>n']
+#   ./install.sh [--monitor NAME] [--theme NAME] [--context SIZE] [--standby banner|full]
+#                [--shortcut '<Super><Alt>n']
 #
 #   --monitor   xrandr output (HDMI-1) or EDID text (a brand name) of the screen to use.
 #               Default: the smallest non-primary monitor.
 #   --theme     colour theme: cyan (default), amber, phosphor, red or violet.
 #   --context   context window the gauge measures against, e.g. 200k or 1m.
 #               Default: 200k, switching to 1m once a session goes past 200k.
+#   --standby   while Claude waits on you: banner (default), a strip along the top of the
+#               monitor, or full, the whole monitor.
 #   --shortcut  GNOME only: bind a key combination that closes the HUD.
 set -euo pipefail
 
 MONITOR=""
 THEME=""
 CONTEXT=""
+STANDBY=""
 SHORTCUT=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --monitor) MONITOR="$2"; shift 2 ;;
     --theme) THEME="$2"; shift 2 ;;
     --context) CONTEXT="$2"; shift 2 ;;
+    --standby) STANDBY="$2"; shift 2 ;;
     --shortcut) SHORTCUT="$2"; shift 2 ;;
     *) echo "unknown option: $1" >&2; exit 1 ;;
   esac
@@ -30,6 +35,10 @@ done
 case "${THEME,,}" in
   ""|cyan|amber|phosphor|red|violet) ;;
   *) echo "unknown theme: $THEME (cyan, amber, phosphor, red, violet)" >&2; exit 1 ;;
+esac
+case "${STANDBY,,}" in
+  ""|banner|full) ;;
+  *) echo "unknown standby: $STANDBY (banner, full)" >&2; exit 1 ;;
 esac
 if [[ -n "$CONTEXT" ]]; then
   CONTEXT=$(python3 -c "
@@ -53,12 +62,13 @@ SETTINGS="$HOME/.claude/settings.json"
 [[ -f "$SETTINGS" ]] || echo '{}' > "$SETTINGS"
 cp "$SETTINGS" "$SETTINGS.bak-neural-hud"
 
-MONITOR="$MONITOR" THEME="${THEME,,}" CONTEXT="$CONTEXT" SETTINGS="$SETTINGS" python3 - <<'EOF'
+MONITOR="$MONITOR" THEME="${THEME,,}" STANDBY="${STANDBY,,}" CONTEXT="$CONTEXT" SETTINGS="$SETTINGS" python3 - <<'EOF'
 import json, os, shlex
 path = os.environ["SETTINGS"]
 s = json.load(open(path))
 cmd = "python3 ~/.claude/neural-hud/hook.py"
-for var, key in (("CONTEXT", "NEURAL_HUD_CONTEXT_WINDOW"), ("THEME", "NEURAL_HUD_THEME"), ("MONITOR", "NEURAL_HUD_MONITOR")):
+for var, key in (("CONTEXT", "NEURAL_HUD_CONTEXT_WINDOW"), ("THEME", "NEURAL_HUD_THEME"), ("MONITOR", "NEURAL_HUD_MONITOR"),
+                 ("STANDBY", "NEURAL_HUD_STANDBY")):
     if os.environ[var]:
         cmd = f"{key}={shlex.quote(os.environ[var])} {cmd}"
 hooks = s.setdefault("hooks", {})

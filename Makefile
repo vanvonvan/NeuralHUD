@@ -7,10 +7,13 @@
 #          `make demo THEME=amber`.
 # CONTEXT: the context window the gauge measures against, e.g. 200k or 1m.
 #          Default: 200k, switching to 1m once a session goes past 200k.
+# STANDBY: while Claude waits on you, banner (default: a strip along the top of
+#          the monitor, so what's under it stays visible) or full (the whole monitor).
 # SHORTCUT: GNOME only, a key combination that closes the HUD.
 MONITOR ?=
 THEME ?=
 CONTEXT ?=
+STANDBY ?=
 SHORTCUT ?=
 
 .PHONY: install uninstall monitors demo test art screenshot close
@@ -20,7 +23,7 @@ SHORTCUT ?=
 # replaces the previous install, so run it again after a `git pull`.
 install:
 	./install.sh $(if $(MONITOR),--monitor '$(MONITOR)') $(if $(THEME),--theme '$(THEME)') \
-		$(if $(CONTEXT),--context '$(CONTEXT)') $(if $(SHORTCUT),--shortcut '$(SHORTCUT)')
+		$(if $(CONTEXT),--context '$(CONTEXT)') $(if $(STANDBY),--standby '$(STANDBY)') $(if $(SHORTCUT),--shortcut '$(SHORTCUT)')
 
 # List connected monitors, their MONITOR= values, and which one the HUD uses
 # by default. With MONITOR=..., also shows which monitor that value picks.
@@ -45,7 +48,7 @@ art:
 # steps, a permission hold and the outro. Runs the repo's hook.py and hud.py
 # (not the installed copies) in a private state dir; Claude Code isn't needed.
 demo:
-	NEURAL_HUD_MONITOR='$(MONITOR)' NEURAL_HUD_THEME='$(THEME)' python3 tools/demo.py
+	NEURAL_HUD_MONITOR='$(MONITOR)' NEURAL_HUD_THEME='$(THEME)' NEURAL_HUD_STANDBY='$(STANDBY)' python3 tools/demo.py
 
 # Render the README screenshots offscreen: mid-task, standby, the end-of-task
 # summary, and a half-size preview of each extra theme.
